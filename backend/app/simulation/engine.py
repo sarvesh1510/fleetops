@@ -339,7 +339,7 @@ class SimulationEngine:
 
         v.updated_at = now
         state.telemetry_counter += 1
-        if self._db and state.telemetry_counter >= self.persist_interval:
+        if self._db is not None and state.telemetry_counter >= self.persist_interval:
             state.telemetry_counter = 0
             await self._persist_telemetry(state)
 
@@ -538,7 +538,7 @@ class SimulationEngine:
         self._orders[order.order_id] = order
         self._pending_orders.append(order)
 
-        if self._db:
+        if self._db is not None:
             try:
                 await self._db.orders.insert_one(order.model_dump())
             except Exception:
@@ -555,7 +555,7 @@ class SimulationEngine:
             await cb(order)
 
     async def _persist_telemetry(self, state: VehicleSimState):
-        if not self._db:
+        if self._db is None:
             return
         v = state.vehicle
         try:

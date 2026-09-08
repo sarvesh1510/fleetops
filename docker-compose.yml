@@ -36,7 +36,9 @@ services:
       - CORS_ORIGINS=["http://localhost:5173","http://localhost:80","http://frontend"]
       - SIMULATION_SPEED=${SIMULATION_SPEED:-1.0}
       - ENVIRONMENT=${ENVIRONMENT:-development}
-      - DEBUG=${DEBUG:-false}
+      # Avoid the generic host DEBUG variable, which is often non-boolean
+      # (for example, DEBUG=release) and prevents Pydantic from starting.
+      - DEBUG=${FLEETOPS_DEBUG:-false}
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 15s

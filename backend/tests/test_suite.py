@@ -145,6 +145,10 @@ class TestAuth:
 # ── Model Tests ───────────────────────────────────────────────────────────────
 
 class TestModels:
+    def test_cng_is_a_supported_fuel_type(self):
+        from app.models.vehicle import FuelType
+        assert FuelType("cng") is FuelType.CNG
+
     def test_vehicle_capacity_properties(self):
         from app.models.vehicle import Vehicle, VehicleType, FuelType, GeoPoint, VehicleHealth, VehicleStatus
         v = Vehicle(
@@ -191,6 +195,29 @@ class TestModels:
 # ── Optimization Engine Tests ─────────────────────────────────────────────────
 
 class TestOptimizationEngine:
+    @pytest.mark.asyncio
+    async def test_finalize_run_does_not_truth_test_database(self):
+        """Motor database handles raise if evaluated as a boolean."""
+        from app.models.optimization import OptimizationRun, OptimizationTrigger
+        from app.optimization.engine import OptimizationEngine
+
+        class Collection:
+            async def insert_one(self, document):
+                return None
+
+        class Database:
+            optimization_runs = Collection()
+
+            def __bool__(self):
+                raise AssertionError("Database must be compared with None, not truth-tested")
+
+        engine = OptimizationEngine()
+        engine.set_db(Database())
+        run = OptimizationRun(run_id="OPT-TEST", trigger=OptimizationTrigger.MANUAL)
+        result = await engine._finalize_run(run, 0)
+
+        assert result.completed_at is not None
+
     def _make_vehicle(self, vehicle_id, lat, lng, capacity=1000, load=0, fuel=80):
         from app.models.vehicle import Vehicle, VehicleType, FuelType, GeoPoint, VehicleHealth, VehicleStatus
         return Vehicle(
