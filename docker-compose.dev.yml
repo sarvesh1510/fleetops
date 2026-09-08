@@ -1,0 +1,38 @@
+version: "3.9"
+
+# Development override — mounts source code directly for hot reload
+services:
+  mongodb:
+    image: mongo:7.0
+    container_name: fleetops_mongo_dev
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data_dev:/data/db
+    environment:
+      MONGO_INITDB_DATABASE: fleetops
+
+  backend:
+    image: python:3.11-slim
+    container_name: fleetops_backend_dev
+    working_dir: /app
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      - mongodb
+    environment:
+      - MONGODB_URI=mongodb://mongodb:27017
+      - MONGODB_DB=fleetops
+      - JWT_SECRET=dev-secret-not-for-production-use
+      - CORS_ORIGINS=["http://localhost:5173"]
+      - SIMULATION_SPEED=1.0
+      - DEBUG=true
+      - ENVIRONMENT=development
+    command: >
+      sh -c "pip install -r requirements.txt -q &&
+             uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload"
+
+volumes:
+  mongo_data_dev:
