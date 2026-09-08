@@ -212,14 +212,17 @@ export default function FleetPage() {
   const [page, setPage] = useState(1)
   const [selectedId, setSelectedId] = useState<string | null>(null)
 
-  const { data, isLoading, refetch } = useQuery({
-    queryKey: ['vehicles', statusFilter, typeFilter, page],
+  const { data, isLoading, isError, refetch } = useQuery({
+    queryKey: ['vehicles', statusFilter === 'all' ? undefined : statusFilter, typeFilter === 'all' ? undefined : typeFilter, page],
     queryFn: () => vehiclesApi.list({
       status: statusFilter !== 'all' ? statusFilter : undefined,
       type: typeFilter !== 'all' ? typeFilter : undefined,
       page, page_size: 50,
     }) as Promise<{ items: Vehicle[]; total: number; pages: number }>,
-    refetchInterval: 5000,
+    refetchInterval: 3000,
+    staleTime: 0,
+    refetchOnMount: 'always',
+    retry: 3,
   })
 
   const { data: statsData } = useQuery({
@@ -294,6 +297,10 @@ export default function FleetPage() {
         <div style={{ flex:1, overflowY:'auto' }}>
           {isLoading ? (
             <div style={{ padding:40, textAlign:'center', color:'var(--text-muted)' }}>Loading fleet…</div>
+          ) : isError ? (
+            <div style={{ padding:40, textAlign:'center', color:'#dc2626' }}>
+              Failed to load vehicles. <button onClick={() => refetch()} style={{ color:'#2563eb', background:'none', border:'none', cursor:'pointer', textDecoration:'underline' }}>Retry</button>
+            </div>
           ) : (
             <table style={{ width:'100%', borderCollapse:'collapse' }}>
               <thead style={{ position:'sticky', top:0, background:'var(--bg-surface)', zIndex:10 }}>
@@ -310,7 +317,13 @@ export default function FleetPage() {
                     onClick={() => setSelectedId(selectedId === v.vehicle_id ? null : v.vehicle_id)}/>
                 ))}
                 {filtered.length === 0 && (
-                  <tr><td colSpan={9} style={{ padding:40, textAlign:'center', color:'var(--text-muted)' }}>No vehicles match filters</td></tr>
+                  <tr>
+                    <td colSpan={9} style={{ padding:40, textAlign:'center', color:'var(--text-muted)' }}>
+                      {(data?.total ?? 0) === 0
+                        ? 'No vehicles found. The simulation may still be starting — click Refresh in a moment.'
+                        : 'No vehicles match the current filters.'}
+                    </td>
+                  </tr>
                 )}
               </tbody>
             </table>
