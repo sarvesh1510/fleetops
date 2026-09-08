@@ -25,6 +25,7 @@ are real evaluation metrics from the training run.
 
 import random
 import warnings
+import asyncio
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import numpy as np
@@ -391,8 +392,8 @@ class MLEngine:
         self.training_metrics: Dict = {}
         self.trained_at: Optional[datetime] = None
 
-    async def train_all(self) -> None:
-        """Train all models. Called at application startup."""
+    def _train_all_sync(self) -> None:
+        """Train models without blocking the application's event loop."""
         logger.info("Training all ML models...")
         metrics = {}
         metrics["eta"] = self.eta_predictor.train()
@@ -401,6 +402,10 @@ class MLEngine:
         self.training_metrics = metrics
         self.trained_at = datetime.utcnow()
         logger.info("All ML models trained", metrics=metrics)
+
+    async def train_all(self) -> None:
+        """Train models in a worker thread so API startup remains responsive."""
+        await asyncio.to_thread(self._train_all_sync)
 
     def get_status(self) -> Dict:
         return {

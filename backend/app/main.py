@@ -103,8 +103,9 @@ async def lifespan(app: FastAPI):
 
     simulation_engine.register_incident_callback(handle_incident)
 
-    # Train ML models
-    await ml_engine.train_all()
+    # Model training is optional for core fleet operations. Run it in the
+    # background so Fleet Management and the API are available immediately.
+    asyncio.create_task(ml_engine.train_all())
 
     # Start simulation
     await simulation_engine.start()

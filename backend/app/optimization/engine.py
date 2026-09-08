@@ -263,7 +263,7 @@ class OptimizationEngine:
             used_vehicles.add(vehicle_id)
 
             # Persist to DB
-            if self._db:
+            if self._db is not None:
                 try:
                     await self._db.orders.update_one(
                         {"order_id": order.order_id},
@@ -431,7 +431,7 @@ class OptimizationEngine:
         best_vehicle.updated_at = datetime.utcnow()
 
         # Persist both order and vehicle state to DB
-        if self._db:
+        if self._db is not None:
             try:
                 await self._db.orders.update_one(
                     {"order_id": order.order_id},
@@ -487,7 +487,7 @@ class OptimizationEngine:
         run.completed_at = datetime.utcnow()
         run.solver_duration_ms = round(time.monotonic() * 1000 - start_ms, 1)
 
-        if self._db:
+        if self._db is not None:
             try:
                 await self._db.optimization_runs.insert_one(run.model_dump())
             except Exception as e:

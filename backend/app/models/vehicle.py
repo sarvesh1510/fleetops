@@ -28,6 +28,7 @@ class VehicleType(str, Enum):
 
 class FuelType(str, Enum):
     DIESEL = "diesel"
+    CNG = "cng"
     ELECTRIC = "electric"
     HYBRID = "hybrid"
     PETROL = "petrol"
