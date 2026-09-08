@@ -67,7 +67,9 @@ export const authApi = {
 // ── Vehicles ───────────────────────────────────────────────────────────────────
 export const vehiclesApi = {
   list: (params?: { status?: string; type?: string; page?: number; page_size?: number }) => {
-    const q = new URLSearchParams(params as Record<string, string>).toString()
+    const q = new URLSearchParams(
+      Object.fromEntries(Object.entries(params || {}).filter(([,v]) => v != null).map(([k,v]) => [k, String(v)]))
+    ).toString()
     return get<{ items: unknown[]; total: number; page: number; pages: number }>(`/vehicles${q ? '?' + q : ''}`)
   },
   get: (id: string) => get<unknown>(`/vehicles/${id}`),

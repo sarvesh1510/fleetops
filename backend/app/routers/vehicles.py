@@ -35,6 +35,7 @@ class VehicleListItem(BaseModel):
 def _vehicle_doc_to_item(v: dict) -> dict:
     coords = v.get("location", {}).get("coordinates", [0, 0])
     health = v.get("health", {})
+    lng = coords[0]
     return {
         "vehicle_id": v["vehicle_id"],
         "name": v["name"],
@@ -43,7 +44,7 @@ def _vehicle_doc_to_item(v: dict) -> dict:
         "status": v["status"],
         "driver_id": v.get("driver_id"),
         "lat": coords[1],
-        "lng": coords[0],
+        "lng": lng,
         "speed": v.get("speed", 0),
         "heading": v.get("heading", 0),
         "fuel_level": v.get("fuel_level", 0),
@@ -54,6 +55,7 @@ def _vehicle_doc_to_item(v: dict) -> dict:
         "health_score": health.get("overall_score", 100),
         "odometer_km": v.get("odometer_km", 0),
         "updated_at": str(v.get("updated_at", "")),
+        "region": v.get("region", "Delhi NCR" if lng > 76.5 else "Mumbai MMR"),
     }
 
 
@@ -67,37 +69,65 @@ async def list_vehicles(
     db=Depends(get_db),
 ):
     """List all vehicles with optional filtering. Live state comes from simulation."""
-    # Prefer live simulation state
+    # Normalise filter params — treat "all", "undefined", or empty string as no filter
+    if status in (None, "", "all", "undefined"):
+        status = None
+    if type in (None, "", "all", "undefined"):
+        type = None
+
+    # Prefer live simulation state; fall back to DB if simulation hasn't loaded yet
     sim_vehicles = simulation_engine.get_all_vehicles()
 
     items = []
-    for v in sim_vehicles:
-        item = {
-            "vehicle_id": v.vehicle_id,
-            "name": v.name,
-            "type": v.type.value,
-            "fuel_type": v.fuel_type.value,
-            "status": v.status.value,
-            "driver_id": v.driver_id,
-            "lat": v.location.coordinates[1],
-            "lng": v.location.coordinates[0],
-            "speed": round(v.speed, 1),
-            "heading": round(v.heading, 1),
-            "fuel_level": round(v.fuel_level, 1),
-            "current_load_kg": round(v.current_load_kg, 1),
-            "max_capacity_kg": v.max_capacity_kg,
-            "current_order_id": v.current_order_id,
-            "eta_minutes": round(v.current_eta_minutes, 1) if v.current_eta_minutes else None,
-            "health_score": round(v.health.overall_score, 1),
-            "odometer_km": round(v.odometer_km, 0),
-            "updated_at": v.updated_at.isoformat(),
-        "region": "Delhi NCR" if v.location.coordinates[0] > 76.5 else "Mumbai MMR",
+
+    if sim_vehicles:
+        for v in sim_vehicles:
+            item = {
+                "vehicle_id": v.vehicle_id,
+                "name": v.name,
+                "type": v.type.value,
+                "fuel_type": v.fuel_type.value,
+                "status": v.status.value,
+                "driver_id": v.driver_id,
+                "lat": v.location.coordinates[1],
+                "lng": v.location.coordinates[0],
+                "speed": round(v.speed, 1),
+                "heading": round(v.heading, 1),
+                "fuel_level": round(v.fuel_level, 1),
+                "current_load_kg": round(v.current_load_kg, 1),
+                "max_capacity_kg": v.max_capacity_kg,
+                "current_order_id": v.current_order_id,
+                "eta_minutes": round(v.current_eta_minutes, 1) if v.current_eta_minutes else None,
+                "health_score": round(v.health.overall_score, 1),
+                "odometer_km": round(v.odometer_km, 0),
+                "updated_at": v.updated_at.isoformat(),
+                "region": "Delhi NCR" if v.location.coordinates[0] > 76.5 else "Mumbai MMR",
+            }
+            if status and item["status"] != status:
+                continue
+            if type and item["type"] != type:
+                continue
+            items.append(item)
+    else:
+        # Simulation not yet loaded — fall back to MongoDB
+        logger.warning("Simulation engine has no vehicles, falling back to DB")
+        query: dict = {}
+        if status:
+            query["status"] = status
+        if type:
+            query["type"] = type
+        cursor = db.vehicles.find(query, {"_id": 0}).skip((page - 1) * page_size).limit(page_size)
+        docs = await cursor.to_list(length=page_size)
+        total_db = await db.vehicles.count_documents(query)
+        for doc in docs:
+            items.append(_vehicle_doc_to_item(doc))
+        return {
+            "items": items,
+            "total": total_db,
+            "page": page,
+            "page_size": page_size,
+            "pages": max(1, (total_db + page_size - 1) // page_size),
         }
-        if status and item["status"] != status:
-            continue
-        if type and item["type"] != type:
-            continue
-        items.append(item)
 
     total = len(items)
     start = (page - 1) * page_size
