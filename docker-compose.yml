@@ -33,7 +33,7 @@ services:
       - MONGODB_URI=mongodb://mongodb:27017
       - MONGODB_DB=fleetops
       - JWT_SECRET=${JWT_SECRET:-change-me-in-production-32-chars-min}
-      - CORS_ORIGINS=["http://localhost:5173","http://localhost:80","http://frontend"]
+      - CORS_ORIGINS=["http://localhost:3000","http://localhost:5173","http://localhost:80","http://frontend"]
       - SIMULATION_SPEED=${SIMULATION_SPEED:-1.0}
       - ENVIRONMENT=${ENVIRONMENT:-development}
       # Avoid the generic host DEBUG variable, which is often non-boolean
