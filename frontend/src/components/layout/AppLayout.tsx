@@ -1,160 +1,97 @@
 import { NavLink, Outlet } from 'react-router-dom'
-import {
-  LayoutDashboard, Truck, Package, AlertTriangle,
-  BarChart3, Brain, Zap, LogOut, Shield, Eye
-} from 'lucide-react'
+import { useQuery } from '@tanstack/react-query'
+import { AlertTriangle, BarChart3, Brain, LayoutDashboard, LogOut, Package, Truck, Zap } from 'lucide-react'
 import { useAuthStore } from '../../stores/authStore'
 import { useWSStore } from '../../stores/wsStore'
 import { useRole } from '../../hooks/useRole'
+import { incidentsApi } from '../../services/api'
+import { cx } from '../../lib/utils'
+import { ToastHost } from '../ui'
 
-const ROLE_COLOR: Record<string, string> = {
-  admin: '#ef4444',
-  operations_manager: '#f97316',
-  dispatcher: '#3b82f6',
-  viewer: '#6b7280',
-}
-
-const ROLE_BADGE_BG: Record<string, string> = {
-  admin: '#fef2f2',
-  operations_manager: '#fff7ed',
-  dispatcher: '#eff6ff',
-  viewer: '#f9fafb',
-}
+const NAV = [
+  {
+    heading: 'Operations',
+    items: [
+      { to: '/', icon: LayoutDashboard, label: 'Dashboard', end: true },
+      { to: '/fleet', icon: Truck, label: 'Fleet' },
+      { to: '/orders', icon: Package, label: 'Orders' },
+      { to: '/incidents', icon: AlertTriangle, label: 'Incidents', badge: true },
+    ],
+  },
+  {
+    heading: 'Insights',
+    items: [
+      { to: '/optimization', icon: Zap, label: 'Dispatch' },
+      { to: '/analytics', icon: BarChart3, label: 'Analytics' },
+      { to: '/predictions', icon: Brain, label: 'Predictions' },
+    ],
+  },
+]
 
 export default function AppLayout() {
   const { user, logout } = useAuthStore()
-  const { connected, liveEvents } = useWSStore()
-  const { role, isDispatcherOrAbove, isAdmin } = useRole()
+  const connected = useWSStore(s => s.connected)
+  const { roleLabel } = useRole()
 
-  const activeIncidents = liveEvents.filter(e => e.type === 'incident.created').length
+  const { data: incidentStats } = useQuery({
+    queryKey: ['incident-stats'],
+    queryFn: incidentsApi.stats,
+    refetchInterval: 30_000,
+  })
+  const activeIncidents = incidentStats?.active ?? 0
 
-  // Nav items with role visibility
-  const navItems = [
-    { to: '/',             icon: LayoutDashboard, label: 'Dashboard',    exact: true, show: true },
-    { to: '/fleet',        icon: Truck,           label: 'Fleet',         exact: false, show: true },
-    { to: '/orders',       icon: Package,         label: 'Orders',        exact: false, show: true },
-    { to: '/incidents',    icon: AlertTriangle,   label: 'Incidents',     exact: false, show: true },
-    { to: '/optimization', icon: Zap,             label: 'Optimization',  exact: false, show: isDispatcherOrAbove },
-    { to: '/analytics',    icon: BarChart3,       label: 'Analytics',     exact: false, show: true },
-    { to: '/predictions',  icon: Brain,           label: 'AI Predictions',exact: false, show: true },
-  ]
-
-  const rc = ROLE_COLOR[role] || '#6b7280'
-  const rb = ROLE_BADGE_BG[role] || '#f9fafb'
+  const initials = (user?.full_name ?? '?').split(' ').map(p => p[0]).slice(0, 2).join('').toUpperCase()
 
   return (
-    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden', background: 'var(--bg-base)' }}>
-      {/* Sidebar */}
-      <aside style={{
-        width: 224,
-        flexShrink: 0,
-        background: 'var(--bg-surface)',
-        borderRight: '1px solid var(--border)',
-        display: 'flex',
-        flexDirection: 'column',
-        boxShadow: '2px 0 8px rgba(15,28,63,0.06)',
-      }}>
-        {/* Logo */}
-        <div style={{ padding: '18px 16px 14px', borderBottom: '1px solid var(--border-subtle)' }}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-            <div style={{
-              width: 34, height: 34, borderRadius: 8,
-              background: 'linear-gradient(135deg, #2563eb, #0891b2)',
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: 15, fontWeight: 800, color: 'white', flexShrink: 0,
-            }}>F</div>
-            <div>
-              <div style={{ fontSize: 14, fontWeight: 800, color: 'var(--text-primary)', letterSpacing: '-0.01em' }}>FleetOps</div>
-              <div style={{ fontSize: 9, color: 'var(--text-muted)', letterSpacing: '0.08em', fontWeight: 600 }}>INDIA LOGISTICS</div>
+    <div className="flex h-screen overflow-hidden bg-canvas">
+      <aside className="flex w-52 flex-shrink-0 flex-col border-r border-line bg-surface">
+        <div className="flex items-center gap-2.5 px-4 py-4">
+          <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-gradient-to-br from-brand to-cyan text-sm font-extrabold text-white">F</span>
+          <div className="min-w-0 flex-1">
+            <div className="text-sm font-extrabold leading-tight text-ink">FleetOps</div>
+            <div className="flex items-center gap-1.5 text-[11px] font-medium text-ink-3">
+              <span className={cx('h-1.5 w-1.5 rounded-full', connected ? 'pulse-live bg-ok' : 'bg-bad')} />
+              {connected ? 'Live' : 'Reconnecting…'}
             </div>
           </div>
         </div>
 
-        {/* Live status */}
-        <div style={{ padding: '10px 16px', borderBottom: '1px solid var(--border-subtle)', display: 'flex', alignItems: 'center', gap: 8 }}>
-          <div style={{ width: 7, height: 7, borderRadius: '50%', background: connected ? '#059669' : '#dc2626', flexShrink: 0 }}
-            className={connected ? 'pulse-live' : ''} />
-          <span style={{ fontSize: 11, fontWeight: 600, color: connected ? '#059669' : '#dc2626' }}>
-            {connected ? 'LIVE' : 'RECONNECTING'}
-          </span>
-          {activeIncidents > 0 && (
-            <span style={{ marginLeft: 'auto', background: '#dc2626', color: 'white', fontSize: 10, fontWeight: 700, padding: '1px 6px', borderRadius: 10 }}>
-              {activeIncidents}
-            </span>
-          )}
-        </div>
-
-        {/* Navigation */}
-        <nav style={{ flex: 1, padding: '8px 8px', overflowY: 'auto' }}>
-          {navItems.filter(n => n.show).map(({ to, icon: Icon, label, exact }) => (
-            <NavLink
-              key={to}
-              to={to}
-              end={exact}
-              style={({ isActive }) => ({
-                display: 'flex', alignItems: 'center', gap: 9,
-                padding: '8px 10px', borderRadius: 7, marginBottom: 2,
-                textDecoration: 'none', fontSize: 13, fontWeight: 500,
-                color: isActive ? '#2563eb' : 'var(--text-secondary)',
-                background: isActive ? '#eff6ff' : 'transparent',
-                transition: 'all 0.12s',
-              })}
-            >
-              {({ isActive }) => (
-                <>
-                  <Icon size={15} style={{ color: isActive ? '#2563eb' : 'var(--text-muted)', flexShrink: 0 }} />
-                  <span style={{ flex: 1 }}>{label}</span>
-                  {label === 'Incidents' && activeIncidents > 0 && (
-                    <span style={{ fontSize: 10, fontWeight: 700, background: '#dc2626', color: 'white', borderRadius: 8, padding: '0 5px', minWidth: 16, textAlign: 'center' }}>
-                      {activeIncidents}
-                    </span>
+        <nav className="flex-1 space-y-4 overflow-y-auto px-2.5 py-2" aria-label="Main">
+          {NAV.map(group => (
+            <div key={group.heading}>
+              <div className="px-2 pb-1 text-[10px] font-bold uppercase tracking-widest text-ink-3">{group.heading}</div>
+              {group.items.map(({ to, icon: Icon, label, end, badge }) => (
+                <NavLink key={to} to={to} end={end}
+                  className={({ isActive }) => cx(
+                    'mb-0.5 flex items-center gap-2.5 rounded-lg px-2.5 py-2 text-[13px] font-medium transition-colors',
+                    isActive ? 'bg-brand-soft text-brand' : 'text-ink-2 hover:bg-hover hover:text-ink')}>
+                  <Icon size={16} className="flex-shrink-0" />
+                  <span className="flex-1">{label}</span>
+                  {badge && activeIncidents > 0 && (
+                    <span className="min-w-5 rounded-full bg-bad px-1.5 text-center text-[10px] font-bold leading-4 text-white">{activeIncidents}</span>
                   )}
-                </>
-              )}
-            </NavLink>
+                </NavLink>
+              ))}
+            </div>
           ))}
         </nav>
 
-        {/* User section */}
-        <div style={{ padding: '12px 14px', borderTop: '1px solid var(--border-subtle)' }}>
-          {/* Role badge */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 10, padding: '5px 8px', background: rb, borderRadius: 6, border: `1px solid ${rc}22` }}>
-            {isAdmin ? <Shield size={11} style={{ color: rc, flexShrink: 0 }} /> :
-             !isDispatcherOrAbove ? <Eye size={11} style={{ color: rc, flexShrink: 0 }} /> :
-             <Shield size={11} style={{ color: rc, flexShrink: 0 }} />}
-            <span style={{ fontSize: 11, fontWeight: 700, color: rc, textTransform: 'uppercase', letterSpacing: '0.04em' }}>
-              {role.replace(/_/g, ' ')}
-            </span>
+        <div className="flex items-center gap-2.5 border-t border-line px-3 py-3">
+          <span className="flex h-8 w-8 flex-shrink-0 items-center justify-center rounded-full bg-hover text-xs font-bold text-ink-2" aria-hidden>{initials}</span>
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-[13px] font-semibold leading-tight text-ink">{user?.full_name}</div>
+            <div className="truncate text-[11px] text-ink-3">{roleLabel}</div>
           </div>
-
-          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', marginBottom: 2, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {user?.full_name}
-          </div>
-          <div style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 10, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-            {user?.email}
-          </div>
-
-          {/* Permissions summary for viewer */}
-          {!isDispatcherOrAbove && (
-            <div style={{ fontSize: 10, color: 'var(--text-muted)', background: '#f9fafb', border: '1px solid var(--border)', borderRadius: 5, padding: '5px 8px', marginBottom: 8, lineHeight: 1.4 }}>
-              👁 Read-only access. Contact a dispatcher to create orders or make changes.
-            </div>
-          )}
-
-          <button
-            onClick={logout}
-            className="btn-ghost"
-            style={{ width: '100%', display: 'flex', alignItems: 'center', gap: 6, justifyContent: 'center', fontSize: 12 }}
-          >
-            <LogOut size={12} /> Sign out
+          <button onClick={logout} className="rounded-md p-1.5 text-ink-3 hover:bg-hover hover:text-ink" aria-label="Sign out" title="Sign out">
+            <LogOut size={15} />
           </button>
         </div>
       </aside>
 
-      {/* Main */}
-      <main style={{ flex: 1, overflow: 'hidden', display: 'flex', flexDirection: 'column' }}>
+      <main className="flex min-w-0 flex-1 flex-col overflow-hidden">
         <Outlet />
       </main>
+      <ToastHost />
     </div>
   )
 }

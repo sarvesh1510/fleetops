@@ -1,26 +1,25 @@
 """
 Machine Learning Module
 
-Real ML models trained on simulated historical data.
-Models are trained at startup using seed data + generated features.
+Models are trained at startup on synthetic data that mirrors Mumbai MMR and
+Delhi NCR delivery patterns (IST peak hours, weekend relief, monsoon-style congestion).
 
-Model 1: ETA Prediction (XGBoost regression)
-  - Inputs: distance, speed, hour, day, stops, vehicle_type, traffic
+Model 1: ETA Prediction (XGBoost regression, monotone-constrained)
+  - Inputs: distance, free-flow speed, hour, day, stops, vehicle_type, traffic, load
   - Output: estimated delivery duration in minutes
-  - Metric: MAE, RMSE
+  - Metric: MAE, RMSE (on a held-out split)
 
-Model 2: Demand Forecast (Linear + seasonal)
+Model 2: Demand Forecast (gradient boosting)
   - Inputs: hour, day_of_week, zone
   - Output: expected order count per zone per hour
-  - Metric: MAE
+  - Metric: MAE (on a held-out split)
 
 Model 3: Anomaly Detection (Isolation Forest)
-  - Inputs: speed, fuel_consumption_rate, stop_duration, route_deviation
-  - Output: anomaly_score (-1 = anomaly, 1 = normal)
-  - Metric: precision/recall on labeled anomalies
+  - Inputs: speed, fuel_consumption_rate, stop_duration, route_deviation, engine temp
+  - Output: anomaly_score (lower = more anomalous) and a flag
 
-NOTE: These are genuine trained models. Metrics shown in the UI
-are real evaluation metrics from the training run.
+NOTE: These are genuinely trained models, but on synthetic data - the metrics
+describe how well they learned that synthetic world, not real-world accuracy.
 """
 
 import random
@@ -51,7 +50,13 @@ logger = structlog.get_logger(__name__)
 class ETAPredictor:
     """
     Predicts delivery duration given route and context features.
-    Trained on synthetic historical data that mirrors realistic London delivery patterns.
+
+    Trained on synthetic history that mirrors Mumbai MMR / Delhi NCR delivery patterns
+    (IST peak hours, weekend relief). The model takes the vehicle's *free-flow* speed
+    (what it would do on empty roads) and the *traffic factor* (congestion multiplier)
+    as independent inputs, and is constrained to be monotonic: more distance, more
+    stops or more traffic can never shorten the ETA, and a faster vehicle can never
+    lengthen it.
     """
 
     def __init__(self) -> None:
@@ -60,54 +65,54 @@ class ETAPredictor:
         self.mae: Optional[float] = None
         self.rmse: Optional[float] = None
         self.feature_names = [
-            "distance_km", "speed_kmh", "hour_of_day", "day_of_week",
+            "distance_km", "free_flow_speed_kmh", "hour_of_day", "day_of_week",
             "n_stops", "vehicle_type_enc", "traffic_factor", "weight_kg_norm",
         ]
+        # +1 = prediction must not decrease as the feature grows, -1 = must not increase
+        self.monotone_constraints = (1, -1, 0, 0, 1, 0, 1, 0)
 
-    def _generate_training_data(self, n_samples: int = 5000) -> pd.DataFrame:
-        """Generate synthetic training data with realistic London delivery patterns."""
-        np.random.seed(42)
+    def _generate_training_data(self, n_samples: int = 6000) -> pd.DataFrame:
+        """Synthetic delivery history: duration = distance / (free-flow / traffic) + stop handling + noise."""
+        rng = np.random.default_rng(42)
         rows = []
         for _ in range(n_samples):
-            distance_km = np.random.uniform(1.5, 28.0)
-            hour = np.random.randint(6, 22)
-            day = np.random.randint(0, 7)
-            n_stops = np.random.randint(1, 8)
-            vehicle_type = np.random.randint(0, 5)
-            weight_kg_norm = np.random.uniform(0.0, 1.0)
+            distance_km = rng.uniform(1.5, 28.0)
+            hour = int(rng.integers(6, 22))
+            day = int(rng.integers(0, 7))
+            n_stops = int(rng.integers(1, 8))
+            vehicle_type = int(rng.integers(0, 5))
+            weight_kg_norm = rng.uniform(0.0, 1.0)
 
-            # Realistic traffic patterns
-            if hour in (8, 9, 17, 18):
-                traffic = np.random.uniform(1.6, 2.4)
-            elif hour in (12, 13):
-                traffic = np.random.uniform(1.2, 1.6)
+            # Congestion by IST hour (Mumbai/Delhi style peaks)
+            if hour in (9, 10, 18, 19):
+                traffic = rng.uniform(1.6, 2.4)
+            elif hour in (12, 13, 14):
+                traffic = rng.uniform(1.2, 1.6)
             elif hour < 7 or hour > 21:
-                traffic = np.random.uniform(0.7, 1.0)
+                traffic = rng.uniform(0.7, 1.0)
             else:
-                traffic = np.random.uniform(1.0, 1.4)
-
+                traffic = rng.uniform(1.0, 1.4)
             if day >= 5:  # weekend
                 traffic *= 0.75
 
-            # Base speed given traffic
-            base_speed = np.random.uniform(28, 48) / traffic
-            actual_duration = (distance_km / base_speed) * 60
-            # Add stop time
-            actual_duration += n_stops * np.random.uniform(4, 12)
-            # Add noise
-            actual_duration += np.random.normal(0, 3)
-            actual_duration = max(actual_duration, 5.0)
+            # Free-flow speed is a property of the vehicle/road, independent of congestion
+            free_flow = rng.uniform(22, 48)
+            effective_speed = free_flow / traffic
+            duration = (distance_km / effective_speed) * 60
+            duration += n_stops * rng.uniform(4, 12)           # handling per stop
+            duration += rng.normal(0, 3)
+            duration = max(duration, 5.0)
 
             rows.append({
                 "distance_km": distance_km,
-                "speed_kmh": base_speed,
+                "free_flow_speed_kmh": free_flow,
                 "hour_of_day": hour,
                 "day_of_week": day,
                 "n_stops": n_stops,
                 "vehicle_type_enc": vehicle_type,
                 "traffic_factor": traffic,
                 "weight_kg_norm": weight_kg_norm,
-                "duration_minutes": actual_duration,
+                "duration_minutes": duration,
             })
         return pd.DataFrame(rows)
 
@@ -121,11 +126,12 @@ class ETAPredictor:
 
         if XGBOOST_AVAILABLE:
             self.model = xgb.XGBRegressor(
-                n_estimators=200,
+                n_estimators=250,
                 max_depth=5,
                 learning_rate=0.08,
                 subsample=0.8,
                 colsample_bytree=0.8,
+                monotone_constraints=self.monotone_constraints,
                 random_state=42,
                 verbosity=0,
             )
@@ -155,16 +161,19 @@ class ETAPredictor:
         traffic_factor: float = 1.0,
         weight_kg_norm: float = 0.5,
     ) -> Tuple[float, float]:
-        """Returns (predicted_minutes, confidence_pct)."""
+        """
+        Returns (predicted_minutes, confidence_pct).
+        `speed_kmh` is the vehicle's free-flow speed; congestion goes in `traffic_factor`.
+        """
         if not self.is_trained or self.model is None:
             # Fallback deterministic estimate
-            base = (distance_km / 35.0) * 60 * traffic_factor + n_stops * 8
+            base = (distance_km / max(speed_kmh, 5.0)) * 60 * traffic_factor + n_stops * 8
             return round(base, 1), 70.0
 
-        features = np.array([[
+        features = pd.DataFrame([[
             distance_km, speed_kmh, hour, day_of_week,
             n_stops, vehicle_type_enc, traffic_factor, weight_kg_norm,
-        ]])
+        ]], columns=self.feature_names)
         pred = float(self.model.predict(features)[0])
         # Confidence based on training MAE relative to prediction
         confidence = max(50.0, min(98.0, 100 - (self.mae / max(pred, 1)) * 50))
@@ -173,8 +182,9 @@ class ETAPredictor:
 
 class DemandForecaster:
     """
-    Predicts order volume per zone per hour using historical patterns.
-    Simple but real: linear regression on cyclic time features.
+    Predicts order volume per zone per hour (orders/hour) from cyclic time features.
+    Each zone has its own base demand level (commercial hubs are busier), so the
+    forecast genuinely differs by zone as well as by hour and weekday.
     """
 
     def __init__(self) -> None:
@@ -187,15 +197,21 @@ class DemandForecaster:
             "Gurgaon DLF", "Faridabad",
         ]
         self.zone_enc = {z: i for i, z in enumerate(self.zones)}
+        # Relative demand level per zone (orders/hour at the baseline hour factor)
+        self.zone_base = {
+            "Bandra": 2.6, "Andheri": 3.0, "Kurla": 2.2, "Thane": 1.8, "Navi Mumbai": 1.6,
+            "Connaught Place": 2.8, "Karol Bagh": 2.0, "Noida Sector 18": 2.4,
+            "Gurgaon DLF": 2.7, "Faridabad": 1.2,
+        }
 
-    def _generate_training_data(self, n_samples: int = 3000) -> pd.DataFrame:
-        np.random.seed(123)
+    def _generate_training_data(self, n_samples: int = 6000) -> pd.DataFrame:
+        rng = np.random.default_rng(123)
         rows = []
         for _ in range(n_samples):
-            hour = np.random.randint(0, 24)
-            day = np.random.randint(0, 7)
-            zone_idx = np.random.randint(0, len(self.zones))
-            zone_demand_base = np.random.uniform(0.5, 3.0)
+            hour = int(rng.integers(0, 24))
+            day = int(rng.integers(0, 7))
+            zone_idx = int(rng.integers(0, len(self.zones)))
+            zone_demand_base = self.zone_base[self.zones[zone_idx]]
 
             # Demand peaks: morning (9-11) and afternoon (14-17)
             hour_factor = 1.0
@@ -211,7 +227,7 @@ class DemandForecaster:
             if day >= 5:
                 hour_factor *= 0.7
 
-            demand = zone_demand_base * hour_factor + np.random.normal(0, 0.3)
+            demand = zone_demand_base * hour_factor + rng.normal(0, 0.3)
             demand = max(0.0, demand)
 
             rows.append({

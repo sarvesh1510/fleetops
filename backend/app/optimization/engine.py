@@ -1,30 +1,40 @@
 """
-Autonomous Optimization Engine
+Dispatch / Optimization Engine
 
-Uses Google OR-Tools to solve the Capacitated Vehicle Routing Problem
-with time windows (CVRPTW).
+Decides which available vehicle serves which pending order.
 
-Key fix: assign_order_to_best_vehicle now ACTUALLY assigns the order —
-it updates the order status, vehicle state, and persists to DB.
+How it works
+------------
+1. Every (order, vehicle) pair is scored by `VehicleScorer`. Hard constraints
+   (operating region, capacity, cold chain, fuel range) disqualify a pair;
+   soft factors (pickup distance, health, deadline pressure) shape the score.
+2. The optimal one-to-one assignment minimising total pickup distance - with a
+   priority bonus so critical orders win scarce vehicles - is found with the
+   Hungarian algorithm (scipy.optimize.linear_sum_assignment).
+3. As an honest baseline we also compute what a naive dispatcher would have done:
+   serve orders first-come-first-served, each taking the nearest feasible vehicle.
+   Reported "improvement" is the real difference between those two plans, measured
+   on the same quantity (total pickup distance / time) - never a fabricated figure.
+
+Runs that did nothing (no assignment made, not requested manually) are not
+persisted, so the history only contains meaningful decisions.
 """
-
-import math
+import asyncio
 import time
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+
+import numpy as np
 import structlog
+from scipy.optimize import linear_sum_assignment
 
-try:
-    from ortools.constraint_solver import pywrapcp, routing_enums_pb2
-    ORTOOLS_AVAILABLE = True
-except ImportError:
-    ORTOOLS_AVAILABLE = False
-
-from app.models.vehicle import Vehicle, VehicleStatus
-from app.models.order import Order, OrderStatus, OrderPriority
 from app.models.optimization import OptimizationRun, OptimizationTrigger, VehicleCandidate
-from app.websocket.broadcaster import broadcaster, WSEventType
+from app.models.order import Order, OrderPriority, OrderStatus
+from app.models.vehicle import Vehicle, VehicleStatus
+from app.simulation.engine import fuel_use_pct_per_km
+from app.utils.geo import haversine_km, region_for_lng
+from app.websocket.broadcaster import WSEventType, broadcaster
 
 logger = structlog.get_logger(__name__)
 
@@ -34,14 +44,15 @@ PRIORITY_WEIGHTS = {
     OrderPriority.NORMAL: 1.0,
     OrderPriority.LOW: 0.5,
 }
-
-
-def haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-    R = 6371.0
-    dlat = math.radians(lat2 - lat1)
-    dlng = math.radians(lng2 - lng1)
-    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlng/2)**2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
+# Distance-equivalent bonus (km) for serving an order when vehicles are scarce.
+PRIORITY_BONUS_KM = {
+    OrderPriority.CRITICAL: 60.0,
+    OrderPriority.HIGH: 30.0,
+    OrderPriority.NORMAL: 10.0,
+    OrderPriority.LOW: 0.0,
+}
+INFEASIBLE_COST = 1e6
+FUEL_RESERVE_PCT = 10.0
 
 
 def estimate_travel_minutes(dist_km: float, traffic_factor: float = 1.0) -> float:
@@ -49,37 +60,57 @@ def estimate_travel_minutes(dist_km: float, traffic_factor: float = 1.0) -> floa
     return (dist_km / avg_speed) * 60 if dist_km > 0 else 0
 
 
-class VehicleScorer:
-    """Multi-factor transparent vehicle scorer. Higher = better fit."""
+def _vehicle_region(v: Vehicle) -> str:
+    return v.region or region_for_lng(v.location.coordinates[0])
 
-    def score(self, vehicle: Vehicle, order: Order, traffic_factor: float = 1.0) -> Tuple[float, List[str], List[str]]:
-        reasons, negatives = [], []
+
+def _order_region(o: Order) -> str:
+    return o.region or region_for_lng(o.pickup.location.coordinates[0])
+
+
+class VehicleScorer:
+    """Multi-factor, explainable vehicle scorer. Higher = better fit; negative = disqualified."""
+
+    def score(
+        self,
+        vehicle: Vehicle,
+        order: Order,
+        traffic_factor: float = 1.0,
+        speed_kmh: Optional[float] = None,
+    ) -> Tuple[float, List[str], List[str]]:
+        reasons: List[str] = []
+        negatives: List[str] = []
         score = 100.0
 
-        vlat = vehicle.location.coordinates[1]
-        vlng = vehicle.location.coordinates[0]
-        plat = order.pickup.location.coordinates[1]
-        plng = order.pickup.location.coordinates[0]
+        if _vehicle_region(vehicle) != _order_region(order):
+            return -999.0, [], [f"Different operating region ({_vehicle_region(vehicle)} vehicle, {_order_region(order)} order)"]
+
+        vlat, vlng = vehicle.location.coordinates[1], vehicle.location.coordinates[0]
+        plat, plng = order.pickup.location.coordinates[1], order.pickup.location.coordinates[0]
+        dlat, dlng = order.delivery.location.coordinates[1], order.delivery.location.coordinates[0]
 
         dist_km = haversine_km(vlat, vlng, plat, plng)
         score -= min(dist_km * 2, 40)
-        eta_min = estimate_travel_minutes(dist_km, traffic_factor)
-        reasons.append(f"{dist_km:.1f} km to pickup — ETA ~{eta_min:.0f} min")
+        eta_min = dist_km / speed_kmh * 60 if speed_kmh else estimate_travel_minutes(dist_km, traffic_factor)
+        reasons.append(f"{dist_km:.1f} km to pickup - ETA ~{eta_min:.0f} min")
 
         available = vehicle.max_capacity_kg - vehicle.current_load_kg
         if available < order.weight_kg:
             return -999.0, [], [f"Insufficient capacity ({available:.0f} kg available, {order.weight_kg:.0f} kg needed)"]
-        score += (available / vehicle.max_capacity_kg) * 10
+        score += (available / vehicle.max_capacity_kg) * 10 if vehicle.max_capacity_kg else 0
         reasons.append(f"{available:.0f} kg available capacity")
 
-        dlat = order.delivery.location.coordinates[1]
-        dlng = order.delivery.location.coordinates[0]
+        if order.requires_refrigeration and vehicle.type.value != "refrigerated":
+            return -999.0, [], ["Refrigerated vehicle required"]
+        if vehicle.type.value == "refrigerated" and not order.requires_refrigeration:
+            score -= 10
+            negatives.append("Refrigerated vehicle reserved for cold-chain orders")
+
         total_dist = dist_km + haversine_km(plat, plng, dlat, dlng)
-        if vehicle.fuel_level < total_dist * 0.04 + 10:
-            score -= 20
-            negatives.append(f"Low fuel ({vehicle.fuel_level:.0f}%)")
-        else:
-            reasons.append(f"Sufficient fuel ({vehicle.fuel_level:.0f}%)")
+        needed_pct = fuel_use_pct_per_km(vehicle.fuel_type.value, vehicle.type.value) * total_dist + FUEL_RESERVE_PCT
+        if vehicle.fuel_level < needed_pct:
+            return -999.0, [], [f"Insufficient fuel ({vehicle.fuel_level:.0f}% available, ~{needed_pct:.0f}% needed incl. reserve)"]
+        reasons.append(f"Sufficient fuel ({vehicle.fuel_level:.0f}%)")
 
         if vehicle.health.overall_score < 50:
             score -= 25
@@ -87,9 +118,6 @@ class VehicleScorer:
         elif vehicle.health.overall_score >= 85:
             score += 5
             reasons.append(f"Good health ({vehicle.health.overall_score:.0f}/100)")
-
-        if order.requires_refrigeration and vehicle.type.value != "refrigerated":
-            return -999.0, [], ["Refrigerated vehicle required"]
 
         score += PRIORITY_WEIGHTS.get(order.priority, 1.0) * 3
 
@@ -109,6 +137,7 @@ class OptimizationEngine:
         self._scorer = VehicleScorer()
         self._db = None
         self._simulation = None
+        self._lock = asyncio.Lock()
 
     def set_db(self, db) -> None:
         self._db = db
@@ -116,376 +145,238 @@ class OptimizationEngine:
     def set_simulation(self, sim) -> None:
         self._simulation = sim
 
+    # ── Public entry points ───────────────────────────────────────────────────
+    async def dispatch(
+        self,
+        trigger: OptimizationTrigger,
+        triggering_vehicle_id: Optional[str] = None,
+        triggering_order_id: Optional[str] = None,
+        triggering_incident_id: Optional[str] = None,
+    ) -> Optional[OptimizationRun]:
+        """Automatic dispatch used by the simulation. Periodic runs skip if one is already in flight."""
+        if trigger == OptimizationTrigger.SCHEDULED and self._lock.locked():
+            return None
+        return await self.run(trigger, triggering_vehicle_id, triggering_order_id, triggering_incident_id)
+
     async def run(
         self,
         trigger: OptimizationTrigger,
         triggering_vehicle_id: Optional[str] = None,
         triggering_order_id: Optional[str] = None,
+        triggering_incident_id: Optional[str] = None,
     ) -> OptimizationRun:
-        run_id = f"OPT-{uuid.uuid4().hex[:8].upper()}"
-        run = OptimizationRun(
-            run_id=run_id,
-            trigger=trigger,
-            triggering_vehicle_id=triggering_vehicle_id,
-            triggering_order_id=triggering_order_id,
-            status="running",
-        )
-
-        await broadcaster.broadcast(WSEventType.OPTIMIZATION_STARTED, {
-            "run_id": run_id,
-            "trigger": trigger.value,
-        })
-
-        start_ms = time.monotonic() * 1000
-
-        try:
-            if self._simulation is None:
-                raise RuntimeError("Simulation not connected")
-
-            vehicles = [v for v in self._simulation.get_all_vehicles()
-                        if v.status in (VehicleStatus.AVAILABLE, VehicleStatus.IDLE)]
-            pending_orders = self._simulation.get_pending_orders()
-
-            run.vehicles_considered = len(vehicles)
-            run.orders_in_scope = len(pending_orders)
-
-            if not pending_orders:
-                run.status = "completed"
-                run.summary = "No pending orders to assign."
-                return await self._finalize_run(run, start_ms)
-
-            if not vehicles:
-                run.status = "completed"
-                run.summary = "No available vehicles at this time."
-                return await self._finalize_run(run, start_ms)
-
-            assignments, candidates_map = self._score_assignments(vehicles, pending_orders)
-            run.candidates = [c for cs in candidates_map.values() for c in cs][:50]
-
-            # Apply assignments to the simulation
-            assigned_count = await self._apply_assignments(assignments, pending_orders, run)
-
-            if ORTOOLS_AVAILABLE and len(pending_orders) >= 2 and len(vehicles) >= 2:
-                await self._compute_vrp_metrics(vehicles, pending_orders, run)
-
-            run.assignments_changed = assigned_count
-            run.status = "completed"
-            run.summary = self._build_summary(run)
-
-        except Exception as e:
-            logger.error("Optimization failed", run_id=run_id, error=str(e), exc_info=True)
-            run.status = "failed"
-            run.error_message = str(e)
-
-        return await self._finalize_run(run, start_ms)
-
-    def _score_assignments(self, vehicles, orders):
-        assignments = {}
-        candidates_map = {}
-        for order in orders:
-            candidates = []
-            best_score = -1.0
-            best_vehicle_id = None
-            for vehicle in vehicles:
-                score, reasons, negatives = self._scorer.score(vehicle, order)
-                vlat = vehicle.location.coordinates[1]
-                vlng = vehicle.location.coordinates[0]
-                plat = order.pickup.location.coordinates[1]
-                plng = order.pickup.location.coordinates[0]
-                dist = haversine_km(vlat, vlng, plat, plng)
-                eta = estimate_travel_minutes(dist)
-                candidate = VehicleCandidate(
-                    vehicle_id=vehicle.vehicle_id,
-                    distance_to_pickup_km=round(dist, 2),
-                    eta_minutes=round(eta, 1),
-                    available_capacity_kg=round(vehicle.max_capacity_kg - vehicle.current_load_kg, 1),
-                    fuel_level=vehicle.fuel_level,
-                    current_load_kg=vehicle.current_load_kg,
-                    score=round(score, 2),
-                    disqualified=score < 0,
-                    disqualification_reason=negatives[0] if negatives and score < 0 else None,
-                    selection_reasons=reasons,
-                )
-                candidates.append(candidate)
-                if score > best_score and not candidate.disqualified:
-                    best_score = score
-                    best_vehicle_id = vehicle.vehicle_id
-            candidates.sort(key=lambda c: c.score, reverse=True)
-            candidates_map[order.order_id] = candidates
-            assignments[order.order_id] = best_vehicle_id
-        return assignments, candidates_map
-
-    async def _apply_assignments(self, assignments, pending_orders, run) -> int:
-        """
-        Actually assign orders to vehicles in the simulation and DB.
-        This is the critical step that was missing before.
-        """
-        assigned = 0
-        used_vehicles = set()
-
-        for order in pending_orders:
-            vehicle_id = assignments.get(order.order_id)
-            if not vehicle_id or vehicle_id in used_vehicles:
-                continue
-
-            # Get the vehicle state
-            state = self._simulation._vehicles.get(vehicle_id)
-            if not state:
-                continue
-            vehicle = state.vehicle
-            if vehicle.status not in (VehicleStatus.AVAILABLE, VehicleStatus.IDLE):
-                continue
-
-            # Actually assign: update order
-            order.status = OrderStatus.ASSIGNED
-            order.assigned_vehicle_id = vehicle_id
-            order.assigned_at = datetime.utcnow()
-            order.estimated_delivery_at = datetime.utcnow() + timedelta(minutes=estimate_travel_minutes(
-                haversine_km(vehicle.location.coordinates[1], vehicle.location.coordinates[0],
-                             order.pickup.location.coordinates[1], order.pickup.location.coordinates[0])
-            ) + 20)
-
-            # Remove from pending
-            if order in self._simulation._pending_orders:
-                self._simulation._pending_orders.remove(order)
-
-            # Update simulation vehicle state
-            state.current_order = order
-            state.phase = "to_pickup"
-            state.set_target(
-                order.pickup.location.coordinates[1],
-                order.pickup.location.coordinates[0],
+        async with self._lock:
+            run = OptimizationRun(
+                run_id=f"OPT-{uuid.uuid4().hex[:8].upper()}",
+                trigger=trigger,
+                triggering_vehicle_id=triggering_vehicle_id,
+                triggering_order_id=triggering_order_id,
+                triggering_incident_id=triggering_incident_id,
+                status="running",
             )
-            vehicle.status = VehicleStatus.EN_ROUTE
-            vehicle.current_order_id = order.order_id
-            vehicle.current_load_kg = order.weight_kg
-            vehicle.updated_at = datetime.utcnow()
-            used_vehicles.add(vehicle_id)
+            if trigger == OptimizationTrigger.MANUAL:
+                await broadcaster.broadcast(WSEventType.OPTIMIZATION_STARTED,
+                                            {"run_id": run.run_id, "trigger": trigger.value})
+            start_ms = time.monotonic() * 1000
+            try:
+                if self._simulation is None:
+                    raise RuntimeError("Simulation not connected")
+                await self._optimise(run)
+                run.status = "completed"
+            except Exception as e:
+                logger.error("Optimization failed", run_id=run.run_id, error=str(e), exc_info=True)
+                run.status = "failed"
+                run.error_message = str(e)
+                run.summary = f"Failed: {e}"
+            return await self._finalize_run(run, start_ms)
 
-            # Persist to DB
-            if self._db is not None:
-                try:
-                    await self._db.orders.update_one(
-                        {"order_id": order.order_id},
-                        {"$set": {
-                            "status": "assigned",
-                            "assigned_vehicle_id": vehicle_id,
-                            "assigned_at": order.assigned_at.isoformat(),
-                            "estimated_delivery_at": order.estimated_delivery_at.isoformat() if order.estimated_delivery_at else None,
-                        }}
-                    )
-                except Exception as e:
-                    logger.error("DB update failed during assignment", error=str(e))
+    # ── Core ──────────────────────────────────────────────────────────────────
+    async def _optimise(self, run: OptimizationRun) -> None:
+        sim = self._simulation
+        vehicles = [v for v in sim.get_all_vehicles() if v.status == VehicleStatus.AVAILABLE]
+        orders = [o for o in sim.get_pending_orders() if o.status == OrderStatus.PENDING]
+        run.vehicles_considered = len(vehicles)
+        run.orders_in_scope = len(orders)
 
+        if not orders:
+            run.summary = "No pending orders - nothing to dispatch."
+            return
+        if not vehicles:
+            run.summary = f"{len(orders)} order(s) waiting; no vehicle is currently available."
+            return
+
+        scored = self._score_matrix(vehicles, orders)
+        optimal = self._solve_assignment(orders, vehicles, scored)
+        baseline = self._baseline_assignment(orders, vehicles, scored)
+        self._fill_metrics(run, orders, vehicles, scored, baseline, optimal)
+        run.candidates = self._top_candidates(orders, vehicles, scored)
+
+        assigned = 0
+        for oi, vi in sorted(optimal.items()):
+            order, vehicle = orders[oi], vehicles[vi]
+            if not await sim.assign_order(vehicle.vehicle_id, order):
+                continue
+            assigned += 1
+            cell = scored[oi][vi]
+            baseline_vehicle = vehicles[baseline[oi]].name if oi in baseline else None
+            reason = "; ".join(cell["reasons"][:3])
+            if baseline_vehicle and baseline[oi] != vi:
+                reason += f". Chosen over nearest-first pick {baseline_vehicle} to improve the overall plan."
             run.decisions.append({
                 "type": "assign",
                 "order_id": order.order_id,
                 "order_ref": order.reference,
-                "vehicle_id": vehicle_id,
+                "priority": order.priority.value,
+                "vehicle_id": vehicle.vehicle_id,
                 "vehicle_name": vehicle.name,
-                "reason": f"Best scoring vehicle: {assignments.get(order.order_id)}",
+                "distance_km": round(cell["dist"], 2),
+                "eta_minutes": round(cell["eta"], 1),
+                "score": round(cell["score"], 1),
+                "reason": reason,
             })
-
-            await broadcaster.broadcast(WSEventType.ORDER_ASSIGNED, {
+        for oi, order in enumerate(orders):
+            if oi in optimal:
+                continue
+            blockers: Dict[str, int] = {}
+            region = _order_region(order)
+            same_region = [vi for vi in range(len(vehicles)) if _vehicle_region(vehicles[vi]) == region]
+            for vi in same_region:
+                cell = scored[oi][vi]
+                if cell["disqualified"] and cell["negatives"]:
+                    key = cell["negatives"][0].split(" (")[0]
+                    blockers[key] = blockers.get(key, 0) + 1
+            if not same_region:
+                reason = f"Waiting: no free vehicle in {region}"
+            elif blockers:
+                reason = f"Waiting: {max(blockers, key=blockers.get)}"
+            else:
+                reason = "Waiting: free vehicles were assigned to higher-value orders"
+            run.decisions.append({
+                "type": "unassigned",
                 "order_id": order.order_id,
-                "reference": order.reference,
-                "vehicle_id": vehicle_id,
-                "vehicle_name": vehicle.name,
-                "customer": order.customer_name,
+                "order_ref": order.reference,
+                "priority": order.priority.value,
+                "reason": reason,
             })
 
-            assigned += 1
-            logger.info("Order assigned by optimizer", order_id=order.order_id, vehicle=vehicle.name)
+        run.assignments_changed = assigned
+        run.routes_updated = assigned
+        run.summary = self._build_summary(run, len(orders), assigned)
 
-        return assigned
+    def _score_matrix(self, vehicles: List[Vehicle], orders: List[Order]) -> List[List[dict]]:
+        sim = self._simulation
+        matrix: List[List[dict]] = []
+        for order in orders:
+            plat, plng = order.pickup.location.coordinates[1], order.pickup.location.coordinates[0]
+            row = []
+            for vehicle in vehicles:
+                speed = sim.expected_speed_kmh(vehicle) if sim else None
+                score, reasons, negatives = self._scorer.score(vehicle, order, speed_kmh=speed)
+                dist = haversine_km(vehicle.location.coordinates[1], vehicle.location.coordinates[0], plat, plng)
+                eta = dist / speed * 60 if speed else estimate_travel_minutes(dist)
+                row.append({
+                    "score": score, "reasons": reasons, "negatives": negatives,
+                    "dist": dist, "eta": eta, "disqualified": score < 0,
+                })
+            matrix.append(row)
+        return matrix
 
-    async def _compute_vrp_metrics(self, vehicles, orders, run):
-        """Compute before/after distance metrics using OR-Tools."""
-        try:
-            depot_lat, depot_lng = 19.0760, 72.8777
-            nodes_lat = [depot_lat]
-            nodes_lng = [depot_lng]
-            for order in orders:
-                nodes_lat.append(order.pickup.location.coordinates[1])
-                nodes_lng.append(order.pickup.location.coordinates[0])
-                nodes_lat.append(order.delivery.location.coordinates[1])
-                nodes_lng.append(order.delivery.location.coordinates[0])
+    @staticmethod
+    def _solve_assignment(orders: List[Order], vehicles: List[Vehicle], scored) -> Dict[int, int]:
+        """Hungarian algorithm on pickup distance, with a per-order priority bonus."""
+        cost = np.empty((len(orders), len(vehicles)))
+        for oi, order in enumerate(orders):
+            bonus = PRIORITY_BONUS_KM.get(order.priority, 0.0)
+            for vi in range(len(vehicles)):
+                cell = scored[oi][vi]
+                cost[oi, vi] = INFEASIBLE_COST if cell["disqualified"] else cell["dist"] - bonus
+        rows, cols = linear_sum_assignment(cost)
+        return {int(r): int(c) for r, c in zip(rows, cols) if cost[r, c] < INFEASIBLE_COST / 2}
 
-            n_nodes = len(nodes_lat)
-            n_vehicles = min(len(vehicles), max(len(orders), 1))
-            SCALE = 100
+    @staticmethod
+    def _baseline_assignment(orders: List[Order], vehicles: List[Vehicle], scored) -> Dict[int, int]:
+        """Naive dispatcher: first-come-first-served, each order takes the nearest feasible free vehicle."""
+        taken: set = set()
+        plan: Dict[int, int] = {}
+        for oi in sorted(range(len(orders)), key=lambda i: orders[i].created_at):
+            best, best_d = None, float("inf")
+            for vi in range(len(vehicles)):
+                cell = scored[oi][vi]
+                if vi in taken or cell["disqualified"]:
+                    continue
+                if cell["dist"] < best_d:
+                    best, best_d = vi, cell["dist"]
+            if best is not None:
+                taken.add(best)
+                plan[oi] = best
+        return plan
 
-            dist_matrix = [[int(haversine_km(nodes_lat[i], nodes_lng[i], nodes_lat[j], nodes_lng[j]) * SCALE)
-                            for j in range(n_nodes)] for i in range(n_nodes)]
+    @staticmethod
+    def _fill_metrics(run, orders, vehicles, scored, baseline, optimal) -> None:
+        """Compare both plans on the orders they both serve (like-for-like)."""
+        common = [oi for oi in optimal if oi in baseline]
+        if not common:
+            return
+        before_km = sum(scored[oi][baseline[oi]]["dist"] for oi in common)
+        after_km = sum(scored[oi][optimal[oi]]["dist"] for oi in common)
+        before_min = sum(scored[oi][baseline[oi]]["eta"] for oi in common)
+        after_min = sum(scored[oi][optimal[oi]]["eta"] for oi in common)
+        run.before_total_distance_km = round(before_km, 2)
+        run.after_total_distance_km = round(after_km, 2)
+        run.before_total_duration_min = round(before_min, 1)
+        run.after_total_duration_min = round(after_min, 1)
+        run.distance_saved_km = round(before_km - after_km, 2)
+        run.time_saved_min = round(before_min - after_min, 1)
+        run.improvement_pct = round((before_km - after_km) / before_km * 100, 1) if before_km > 0 else 0.0
 
-            manager = pywrapcp.RoutingIndexManager(n_nodes, n_vehicles, 0)
-            routing = pywrapcp.RoutingModel(manager)
+    @staticmethod
+    def _top_candidates(orders, vehicles, scored, per_order: int = 4, cap: int = 40) -> List[VehicleCandidate]:
+        out: List[VehicleCandidate] = []
+        for oi in range(len(orders)):
+            ranked = sorted(range(len(vehicles)), key=lambda vi: scored[oi][vi]["score"], reverse=True)[:per_order]
+            for vi in ranked:
+                cell, v = scored[oi][vi], vehicles[vi]
+                out.append(VehicleCandidate(
+                    vehicle_id=v.vehicle_id,
+                    distance_to_pickup_km=round(cell["dist"], 2),
+                    eta_minutes=round(cell["eta"], 1),
+                    available_capacity_kg=round(v.max_capacity_kg - v.current_load_kg, 1),
+                    fuel_level=round(v.fuel_level, 1),
+                    current_load_kg=round(v.current_load_kg, 1),
+                    score=round(cell["score"], 2),
+                    disqualified=cell["disqualified"],
+                    disqualification_reason=cell["negatives"][0] if cell["disqualified"] and cell["negatives"] else None,
+                    selection_reasons=cell["reasons"],
+                ))
+            if len(out) >= cap:
+                break
+        return out[:cap]
 
-            def dist_cb(fi, ti):
-                return dist_matrix[manager.IndexToNode(fi)][manager.IndexToNode(ti)]
-            cb_idx = routing.RegisterTransitCallback(dist_cb)
-            routing.SetArcCostEvaluatorOfAllVehicles(cb_idx)
-
-            params = pywrapcp.DefaultRoutingSearchParameters()
-            params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-            params.time_limit.seconds = 2
-
-            solution = routing.SolveWithParameters(params)
-            if solution:
-                total_after = sum(
-                    dist_matrix[manager.IndexToNode(routing.Start(v))][manager.IndexToNode(solution.Value(routing.NextVar(routing.Start(v))))] / SCALE
-                    for v in range(n_vehicles)
-                )
-                total_before = sum(
-                    haversine_km(vehicles[i % len(vehicles)].location.coordinates[1],
-                                 vehicles[i % len(vehicles)].location.coordinates[0],
-                                 orders[i].pickup.location.coordinates[1],
-                                 orders[i].pickup.location.coordinates[0])
-                    for i in range(len(orders))
-                ) if orders else 0
-
-                run.before_total_distance_km = round(total_before, 1)
-                run.after_total_distance_km = round(total_after, 1)
-                run.distance_saved_km = round(max(0, total_before - total_after), 1)
-                run.before_total_duration_min = round(estimate_travel_minutes(total_before), 1)
-                run.after_total_duration_min = round(estimate_travel_minutes(total_after), 1)
-                run.time_saved_min = round(max(0, run.before_total_duration_min - run.after_total_duration_min), 1)
-                if total_before > 0:
-                    run.improvement_pct = round(max(0, (1 - total_after / total_before) * 100), 1)
-                run.routes_updated = n_vehicles
-        except Exception as e:
-            logger.warning("VRP metrics computation failed", error=str(e))
-
-    async def assign_order_to_best_vehicle(self, order: Order) -> Optional[VehicleCandidate]:
-        """
-        Find AND ACTUALLY ASSIGN the best available vehicle for a new order.
-        Called when a new order is created manually via the API.
-        """
-        if self._simulation is None:
-            return None
-
-        vehicles = [v for v in self._simulation.get_all_vehicles()
-                    if v.status in (VehicleStatus.AVAILABLE, VehicleStatus.IDLE)]
-        if not vehicles:
-            logger.info("No available vehicles for immediate assignment", order_id=order.order_id)
-            return None
-
-        best_score = -999.0
-        best_candidate = None
-        best_vehicle = None
-
-        for vehicle in vehicles:
-            score, reasons, negatives = self._scorer.score(vehicle, order)
-            vlat = vehicle.location.coordinates[1]
-            vlng = vehicle.location.coordinates[0]
-            plat = order.pickup.location.coordinates[1]
-            plng = order.pickup.location.coordinates[0]
-            dist = haversine_km(vlat, vlng, plat, plng)
-            eta = estimate_travel_minutes(dist)
-            candidate = VehicleCandidate(
-                vehicle_id=vehicle.vehicle_id,
-                distance_to_pickup_km=round(dist, 2),
-                eta_minutes=round(eta, 1),
-                available_capacity_kg=round(vehicle.max_capacity_kg - vehicle.current_load_kg, 1),
-                fuel_level=vehicle.fuel_level,
-                current_load_kg=vehicle.current_load_kg,
-                score=round(score, 2),
-                disqualified=score < 0,
-                selection_reasons=reasons,
+    @staticmethod
+    def _build_summary(run: OptimizationRun, n_orders: int, assigned: int) -> str:
+        parts = [f"Assigned {assigned} of {n_orders} pending order(s) using {run.vehicles_considered} available vehicle(s)."]
+        waiting = n_orders - assigned
+        if waiting:
+            parts.append(f"{waiting} still waiting.")
+        if run.before_total_distance_km is not None and run.after_total_distance_km is not None:
+            delta = run.improvement_pct or 0.0
+            parts.append(
+                f"Total pickup distance {run.after_total_distance_km:.1f} km vs "
+                f"{run.before_total_distance_km:.1f} km with first-come nearest-vehicle dispatch "
+                f"({delta:+.1f}%)."
             )
-            if score > best_score and not candidate.disqualified:
-                best_score = score
-                best_candidate = candidate
-                best_vehicle = vehicle
-
-        if not best_candidate or not best_vehicle:
-            return None
-
-        # ── ACTUALLY ASSIGN ───────────────────────────────────────────────────
-        state = self._simulation._vehicles.get(best_vehicle.vehicle_id)
-        if not state:
-            return best_candidate
-
-        # Update order
-        order.status = OrderStatus.ASSIGNED
-        order.assigned_vehicle_id = best_vehicle.vehicle_id
-        order.assigned_at = datetime.utcnow()
-        order.eta_minutes = best_candidate.eta_minutes
-        order.estimated_delivery_at = datetime.utcnow() + timedelta(minutes=best_candidate.eta_minutes + 20)
-
-        # Remove from pending
-        if order in self._simulation._pending_orders:
-            self._simulation._pending_orders.remove(order)
-
-        # Update simulation state
-        state.current_order = order
-        state.phase = "to_pickup"
-        state.set_target(
-            order.pickup.location.coordinates[1],
-            order.pickup.location.coordinates[0],
-        )
-        best_vehicle.status = VehicleStatus.EN_ROUTE
-        best_vehicle.current_order_id = order.order_id
-        best_vehicle.current_load_kg = order.weight_kg
-        best_vehicle.current_eta_minutes = best_candidate.eta_minutes
-        best_vehicle.updated_at = datetime.utcnow()
-
-        # Persist both order and vehicle state to DB
-        if self._db is not None:
-            try:
-                await self._db.orders.update_one(
-                    {"order_id": order.order_id},
-                    {"$set": {
-                        "status": "assigned",
-                        "assigned_vehicle_id": best_vehicle.vehicle_id,
-                        "assigned_at": order.assigned_at.isoformat(),
-                        "eta_minutes": best_candidate.eta_minutes,
-                        "estimated_delivery_at": order.estimated_delivery_at.isoformat(),
-                    }}
-                )
-            except Exception as e:
-                logger.error("Failed to persist order assignment", error=str(e))
-
-        # Broadcast assignment event
-        await broadcaster.broadcast(WSEventType.ORDER_ASSIGNED, {
-            "order_id": order.order_id,
-            "reference": order.reference,
-            "vehicle_id": best_vehicle.vehicle_id,
-            "vehicle_name": best_vehicle.name,
-            "customer": order.customer_name,
-            "eta_minutes": best_candidate.eta_minutes,
-            "distance_km": best_candidate.distance_to_pickup_km,
-            "reasons": best_candidate.selection_reasons,
-            "score": best_candidate.score,
-        })
-
-        logger.info(
-            "Order assigned immediately",
-            order_id=order.order_id,
-            vehicle=best_vehicle.name,
-            eta_min=best_candidate.eta_minutes,
-            score=best_candidate.score,
-        )
-        return best_candidate
-
-    def _build_summary(self, run: OptimizationRun) -> str:
-        if run.status == "failed":
-            return f"Failed: {run.error_message}"
-        parts = [f"Trigger: {run.trigger.value}."]
-        parts.append(f"Evaluated {run.vehicles_considered} vehicles, {run.orders_in_scope} pending orders.")
-        if run.assignments_changed:
-            parts.append(f"{run.assignments_changed} order(s) assigned.")
-        if run.improvement_pct:
-            parts.append(f"Route efficiency improved by {run.improvement_pct:.1f}%.")
-        if run.time_saved_min:
-            parts.append(f"Estimated {run.time_saved_min:.0f} min saved.")
-        if not run.assignments_changed and not run.improvement_pct:
-            parts.append("No actionable improvements found — fleet already optimal.")
         return " ".join(parts)
 
+    # ── Persistence ───────────────────────────────────────────────────────────
     async def _finalize_run(self, run: OptimizationRun, start_ms: float) -> OptimizationRun:
         run.completed_at = datetime.utcnow()
         run.solver_duration_ms = round(time.monotonic() * 1000 - start_ms, 1)
+
+        meaningful = (run.trigger == OptimizationTrigger.MANUAL
+                      or run.assignments_changed > 0
+                      or run.status == "failed")
+        if not meaningful:
+            return run
 
         if self._db is not None:
             try:
@@ -503,7 +394,6 @@ class OptimizationEngine:
             "time_saved_min": run.time_saved_min,
             "summary": run.summary,
         })
-
         return run
 
 

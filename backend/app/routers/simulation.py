@@ -1,5 +1,5 @@
 """
-Simulation control router — role-restricted demo controls.
+Simulation control router - role-restricted demo controls.
 WebSocket handler for real-time fleet updates.
 
 Role requirements:
@@ -9,13 +9,19 @@ Role requirements:
   - Start/stop simulation: admin only
 """
 import uuid
-from fastapi import APIRouter, Depends, WebSocket, WebSocketDisconnect, Query
-from pydantic import BaseModel
-import structlog
+from typing import Optional
 
-from app.core.auth import get_current_user, require_dispatcher_or_above, require_ops_or_above, require_admin
+import structlog
+from fastapi import APIRouter, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
+from pydantic import BaseModel, Field
+
+from app.core.auth import (
+    decode_token, get_current_user, require_admin, require_dispatcher_or_above, require_ops_or_above,
+)
+from app.db.database import get_db
 from app.simulation.engine import simulation_engine
-from app.websocket.broadcaster import broadcaster, WSEventType
+from app.utils.geo import REGIONS
+from app.websocket.broadcaster import WSEventType, broadcaster
 
 logger = structlog.get_logger(__name__)
 
@@ -23,7 +29,7 @@ sim_router = APIRouter(prefix="/simulation", tags=["simulation"])
 
 
 class SpeedRequest(BaseModel):
-    speed: float
+    speed: float = Field(..., ge=0.1, le=20.0)
 
 
 @sim_router.get("/status")
@@ -34,15 +40,15 @@ async def sim_status(current_user: dict = Depends(get_current_user)):
         "paused": simulation_engine.paused,
         "speed": simulation_engine.speed,
         "tick_count": simulation_engine.tick_count,
-        "vehicle_count": len(simulation_engine._vehicles),
-        "pending_orders": len(simulation_engine._pending_orders),
+        "vehicle_count": len(simulation_engine.get_all_vehicles()),
+        "pending_orders": simulation_engine.pending_count,
+        "traffic": {r: simulation_engine.traffic_factor(r) for r in REGIONS},
         "connections": broadcaster.connection_count,
     }
 
 
 @sim_router.post("/start")
 async def start_sim(current_user: dict = Depends(require_admin)):
-    """Admin only — start simulation."""
     await simulation_engine.start()
     logger.info("Simulation started", by=current_user["username"])
     return {"status": "started"}
@@ -50,59 +56,63 @@ async def start_sim(current_user: dict = Depends(require_admin)):
 
 @sim_router.post("/pause")
 async def pause_sim(current_user: dict = Depends(require_ops_or_above)):
-    """Ops manager and above can pause."""
     simulation_engine.pause()
-    logger.info("Simulation paused", by=current_user["username"])
-    return {"status": "paused"}
+    await _broadcast_status(current_user["username"])
+    return {"status": "paused", "paused": True}
 
 
 @sim_router.post("/resume")
 async def resume_sim(current_user: dict = Depends(require_ops_or_above)):
-    """Ops manager and above can resume."""
     simulation_engine.resume()
-    logger.info("Simulation resumed", by=current_user["username"])
-    return {"status": "resumed"}
+    await _broadcast_status(current_user["username"])
+    return {"status": "resumed", "paused": False}
 
 
 @sim_router.post("/speed")
 async def set_speed(req: SpeedRequest, current_user: dict = Depends(require_ops_or_above)):
-    """Ops manager and above can change sim speed."""
     simulation_engine.set_speed(req.speed)
+    await _broadcast_status(current_user["username"])
+    return {"speed": simulation_engine.speed}
+
+
+async def _broadcast_status(username: str):
     await broadcaster.broadcast(WSEventType.SIMULATION_STATUS, {
         "speed": simulation_engine.speed,
         "running": simulation_engine.running,
         "paused": simulation_engine.paused,
-        "changed_by": current_user["username"],
+        "changed_by": username,
     })
-    logger.info("Simulation speed changed", speed=simulation_engine.speed, by=current_user["username"])
-    return {"speed": simulation_engine.speed}
 
 
 @sim_router.post("/trigger/traffic")
-async def trigger_traffic(current_user: dict = Depends(require_dispatcher_or_above)):
-    """Dispatcher and above can trigger traffic events."""
-    await simulation_engine.trigger_traffic_event()
-    logger.info("Traffic event triggered", by=current_user["username"])
-    return {"message": "Traffic surge triggered"}
+async def trigger_traffic(
+    region: Optional[str] = Query(None, description="'Mumbai MMR' or 'Delhi NCR' (default Mumbai MMR)"),
+    current_user: dict = Depends(require_dispatcher_or_above),
+):
+    if region is not None and region not in REGIONS:
+        raise HTTPException(status_code=422, detail=f"region must be one of {list(REGIONS)}")
+    result = await simulation_engine.trigger_traffic_event(region)
+    logger.info("Traffic event triggered", by=current_user["username"], **result)
+    return {"message": f"Traffic surge in {result['region']} - {result['affected']} vehicle(s) affected", **result}
 
 
 @sim_router.post("/trigger/breakdown")
 async def trigger_breakdown(
-    vehicle_id: str = Query(None),
+    vehicle_id: Optional[str] = Query(None),
     current_user: dict = Depends(require_dispatcher_or_above),
 ):
-    """Dispatcher and above can trigger breakdowns."""
-    await simulation_engine.trigger_breakdown_event(vehicle_id)
-    logger.info("Breakdown triggered", vehicle_id=vehicle_id, by=current_user["username"])
-    return {"message": "Breakdown triggered"}
+    hit = await simulation_engine.trigger_breakdown_event(vehicle_id)
+    if hit is None:
+        raise HTTPException(status_code=409, detail="No eligible vehicle to break down (none en route)")
+    logger.info("Breakdown triggered", vehicle_id=hit, by=current_user["username"])
+    return {"message": "Breakdown triggered", "vehicle_id": hit}
 
 
 @sim_router.post("/trigger/order")
 async def trigger_order(current_user: dict = Depends(require_dispatcher_or_above)):
-    """Dispatcher and above can inject a new random order."""
-    await simulation_engine._generate_random_order()
+    order = await simulation_engine.generate_random_order()
     logger.info("Demo order injected", by=current_user["username"])
-    return {"message": "Random order created"}
+    return {"message": "Random order created", "order_id": order.order_id if order else None}
 
 
 # ── WebSocket Handler ─────────────────────────────────────────────────────────
@@ -111,38 +121,20 @@ ws_router = APIRouter(tags=["websocket"])
 
 @ws_router.websocket("/ws/fleet")
 async def fleet_websocket(websocket: WebSocket):
-    """
-    WebSocket endpoint — no auth required (token optional via query param).
-    All data sent is read-only fleet state.
-    """
+    """Live fleet feed. Requires a valid JWT as ?token=..."""
+    token = websocket.query_params.get("token")
+    try:
+        payload = decode_token(token) if token else None
+        user = await get_db().users.find_one({"user_id": payload["sub"]}) if payload else None
+        if not user or not user.get("is_active"):
+            raise ValueError("unauthorised")
+    except Exception:
+        await websocket.close(code=4401)
+        return
+
     conn_id = str(uuid.uuid4())
     await broadcaster.connect(websocket, conn_id)
-
-    # Send immediate snapshot
-    vehicles = simulation_engine.get_all_vehicles()
-    snapshot = {
-        "vehicles": [
-            {
-                "vehicle_id": v.vehicle_id,
-                "name": v.name,
-                "status": v.status.value,
-                "lat": v.location.coordinates[1],
-                "lng": v.location.coordinates[0],
-                "speed": round(v.speed, 1),
-                "heading": round(v.heading, 1),
-                "fuel_level": round(v.fuel_level, 1),
-                "current_load_kg": round(v.current_load_kg, 1),
-                "current_order_id": v.current_order_id,
-                "eta_minutes": round(v.current_eta_minutes, 1) if v.current_eta_minutes else None,
-                "health_score": round(v.health.overall_score, 1),
-            }
-            for v in vehicles
-        ],
-        "tick": simulation_engine.tick_count,
-        "sim_speed": simulation_engine.speed,
-        "pending_orders": len(simulation_engine._pending_orders),
-    }
-    await broadcaster.send_to(conn_id, WSEventType.FLEET_SNAPSHOT, snapshot)
+    await broadcaster.send_to(conn_id, WSEventType.FLEET_SNAPSHOT, simulation_engine.build_fleet_snapshot())
 
     try:
         while True:

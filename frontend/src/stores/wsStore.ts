@@ -1,115 +1,164 @@
 /**
- * WebSocket store — manages the live connection and processes incoming events.
- * Uses Zustand for state with WebSocket integration.
+ * Live connection to /ws/fleet. Holds the latest fleet snapshot, a short live-event feed,
+ * and nudges React Query to refetch whatever a pushed event makes stale.
  */
 import { create } from 'zustand'
-import type { FleetSnapshot, LiveEvent, WSEventType } from '../types'
+import type { FleetSnapshot, LiveEvent, LiveVehicle, WSEventType } from '../types'
+import { queryClient } from '../lib/queryClient'
 
-const WS_URL = import.meta.env.VITE_WS_BASE_URL || `ws://${window.location.host}/ws/fleet`
+const WS_BASE =
+  import.meta.env.VITE_WS_BASE_URL ||
+  `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}/ws/fleet`
+
+type EventData = Record<string, unknown>
 
 interface WSStore {
   connected: boolean
-  fleetSnapshot: FleetSnapshot | null
+  vehicleMap: Map<string, LiveVehicle>
   liveEvents: LiveEvent[]
-  vehicleMap: Map<string, FleetSnapshot['vehicles'][0]>
   simSpeed: number
+  paused: boolean
   pendingOrders: number
+  traffic: Record<string, number>
 
   connect: () => void
   disconnect: () => void
   clearEvents: () => void
 }
 
-function makeEvent(type: WSEventType, data: Record<string, unknown>): LiveEvent {
-  const id = `${Date.now()}-${Math.random().toString(36).slice(2)}`
-  const timestamp = new Date().toISOString()
+const str = (v: unknown, fallback = '') => (typeof v === 'string' ? v : fallback)
 
+/** Turn a pushed event into a feed entry, or null when it should not appear in the feed. */
+function toFeedEvent(type: WSEventType, d: EventData): LiveEvent | null {
+  const base = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`, type, timestamp: new Date().toISOString() }
   switch (type) {
-    case 'order.assigned':
-      return { id, type, timestamp, title: 'Order Assigned', detail: `${data.reference} → ${data.vehicle_id}`, severity: 'info', vehicle_id: data.vehicle_id as string }
-    case 'delivery.completed':
-      return { id, type, timestamp, title: 'Delivery Completed', detail: `${data.reference} for ${data.customer}`, severity: 'success', vehicle_id: data.vehicle_id as string }
     case 'order.created':
-      return { id, type, timestamp, title: 'New Order', detail: `${data.reference} — ${data.priority} priority`, severity: (data.priority === 'critical' || data.priority === 'high') ? 'warning' : 'info' }
+      return { ...base, title: 'New order', detail: `${str(d.reference)} · ${str(d.priority)} priority`,
+        severity: d.priority === 'critical' || d.priority === 'high' ? 'warning' : 'info' }
+    case 'order.assigned':
+      return { ...base, title: 'Order assigned', detail: `${str(d.reference)} → ${str(d.vehicle_name, str(d.vehicle_id))}`,
+        severity: 'info', vehicle_id: str(d.vehicle_id) }
+    case 'delivery.completed':
+      return { ...base, title: d.on_time === false ? 'Delivered late' : 'Delivered',
+        detail: `${str(d.reference)} · ${str(d.customer)}`,
+        severity: d.on_time === false ? 'warning' : 'success', vehicle_id: str(d.vehicle_id) }
     case 'incident.created':
-      return { id, type, timestamp, title: `Incident: ${data.title}`, detail: data.description as string || '', severity: (data.severity === 'critical' || data.severity === 'high') ? 'error' : 'warning', vehicle_id: data.vehicle_id as string }
-    case 'vehicle.rerouted':
-      return { id, type, timestamp, title: 'Vehicle Rerouted', detail: `${data.vehicle_id} — ${data.reason}`, severity: 'info', vehicle_id: data.vehicle_id as string }
+      return { ...base, title: str(d.title, 'Incident'), detail: str(d.description),
+        severity: d.severity === 'critical' || d.severity === 'high' ? 'error' : 'warning', vehicle_id: str(d.vehicle_id) }
+    case 'incident.resolved':
+      return { ...base, title: `Resolved: ${str(d.title)}`, detail: '', severity: 'success' }
     case 'optimization.completed':
-      return { id, type, timestamp, title: 'Optimization Complete', detail: `${data.improvement_pct ?? 0}% improvement — ${data.assignments_changed} changes`, severity: 'success' }
+      return Number(d.assignments_changed) > 0
+        ? { ...base, title: 'Dispatch run', detail: str(d.summary), severity: 'info' }
+        : null
     case 'alert.created':
-      return { id, type, timestamp, title: data.message as string, detail: '', severity: data.severity === 'high' ? 'error' : 'warning' }
+      return { ...base, title: str(d.message, 'Alert'), detail: '',
+        severity: d.severity === 'high' ? 'error' : d.severity === 'low' ? 'info' : 'warning' }
     default:
-      return { id, type, timestamp, title: type, detail: '', severity: 'info' }
+      return null
   }
+}
+
+/** Which cached queries a pushed event invalidates. Throttled so bursts cause one refetch. */
+const INVALIDATIONS: Partial<Record<WSEventType, string[]>> = {
+  'order.created': ['orders', 'order-stats'],
+  'order.assigned': ['orders', 'order-stats', 'vehicle-detail'],
+  'delivery.completed': ['orders', 'order-stats', 'deliveries-hour', 'analytics-overview', 'vehicle-detail'],
+  'incident.created': ['incidents', 'incident-stats'],
+  'incident.updated': ['incidents', 'incident-stats'],
+  'incident.resolved': ['incidents', 'incident-stats'],
+  'optimization.completed': ['opt-runs', 'opt-stats', 'orders', 'order-stats'],
+}
+const pending = new Set<string>()
+let flushTimer: ReturnType<typeof setTimeout> | null = null
+function scheduleInvalidate(keys: string[]) {
+  keys.forEach(k => pending.add(k))
+  if (flushTimer) return
+  flushTimer = setTimeout(() => {
+    pending.forEach(k => queryClient.invalidateQueries({ queryKey: [k] }))
+    pending.clear()
+    flushTimer = null
+  }, 800)
 }
 
 let socket: WebSocket | null = null
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null
+let attempts = 0
+let intentionalClose = false
 
 export const useWSStore = create<WSStore>((set, get) => ({
   connected: false,
-  fleetSnapshot: null,
-  liveEvents: [],
   vehicleMap: new Map(),
+  liveEvents: [],
   simSpeed: 1,
+  paused: false,
   pendingOrders: 0,
+  traffic: {},
 
   connect() {
-    if (socket?.readyState === WebSocket.OPEN) return
-
+    if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return
     const token = localStorage.getItem('fleetops_token')
-    const url = token ? `${WS_URL}?token=${token}` : WS_URL
+    if (!token) return
+    intentionalClose = false
 
-    socket = new WebSocket(url)
+    const ws = new WebSocket(`${WS_BASE}?token=${encodeURIComponent(token)}`)
+    socket = ws
 
-    socket.onopen = () => {
+    ws.onopen = () => {
+      attempts = 0
       set({ connected: true })
-      if (reconnectTimer) {
-        clearTimeout(reconnectTimer)
-        reconnectTimer = null
+    }
+
+    ws.onmessage = (e) => {
+      let msg: { event: WSEventType; data: EventData }
+      try { msg = JSON.parse(e.data) } catch { return }
+      const { event, data } = msg
+
+      if (event === 'fleet.snapshot') {
+        const snap = data as unknown as FleetSnapshot
+        set({
+          vehicleMap: new Map(snap.vehicles.map(v => [v.vehicle_id, v])),
+          simSpeed: snap.sim_speed,
+          paused: snap.paused,
+          pendingOrders: snap.pending_orders,
+          traffic: snap.traffic ?? {},
+        })
+        return
       }
+      if (event === 'simulation.status') {
+        set({ simSpeed: Number(data.speed) || get().simSpeed, paused: Boolean(data.paused) })
+        return
+      }
+
+      const feed = toFeedEvent(event, data)
+      if (feed) set(s => ({ liveEvents: [feed, ...s.liveEvents].slice(0, 100) }))
+      const keys = INVALIDATIONS[event]
+      if (keys) scheduleInvalidate(keys)
     }
 
-    socket.onmessage = (e) => {
-      try {
-        const msg = JSON.parse(e.data) as { event: WSEventType; data: Record<string, unknown> }
-        const { event, data } = msg
-
-        if (event === 'fleet.snapshot') {
-          const snapshot = data as unknown as FleetSnapshot
-          const vehicleMap = new Map(snapshot.vehicles.map(v => [v.vehicle_id, v]))
-          set({
-            fleetSnapshot: snapshot,
-            vehicleMap,
-            simSpeed: snapshot.sim_speed,
-            pendingOrders: snapshot.pending_orders,
-          })
-          return
-        }
-
-        // All other events go to the live feed (max 100 entries)
-        const liveEvent = makeEvent(event, data)
-        set(state => ({
-          liveEvents: [liveEvent, ...state.liveEvents].slice(0, 100),
-        }))
-      } catch {}
-    }
-
-    socket.onerror = () => {}
-
-    socket.onclose = () => {
+    ws.onclose = (ev) => {
       set({ connected: false })
-      // Auto-reconnect after 3s
-      reconnectTimer = setTimeout(() => get().connect(), 3000)
+      socket = null
+      if (intentionalClose) return
+      if (ev.code === 4401) {
+        // Token rejected: the session is no longer valid
+        localStorage.removeItem('fleetops_token')
+        localStorage.removeItem('fleetops_user')
+        window.location.assign('/login')
+        return
+      }
+      attempts += 1
+      reconnectTimer = setTimeout(() => get().connect(), Math.min(1000 * 2 ** attempts, 15_000))
     }
+    ws.onerror = () => ws.close()
   },
 
   disconnect() {
+    intentionalClose = true
     if (reconnectTimer) clearTimeout(reconnectTimer)
     socket?.close()
     socket = null
-    set({ connected: false })
+    set({ connected: false, vehicleMap: new Map(), liveEvents: [] })
   },
 
   clearEvents() {

@@ -1,167 +1,173 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef } from 'react'
+import L from 'leaflet'
+import 'leaflet/dist/leaflet.css'
 import { useWSStore } from '../../stores/wsStore'
 import { vehicleStatusColor } from '../../lib/utils'
-
-let L: typeof import('leaflet') | null = null
-
-interface VehiclePoint {
-  vehicle_id: string; name: string; status: string; lat: number; lng: number
-  speed: number; heading: number; fuel_level: number; current_order_id: string | null
-  eta_minutes: number | null; health_score: number; region?: string
-}
+import type { LiveVehicle, Region } from '../../types'
 
 interface Props {
-  selectedVehicleId?: string | null
-  onVehicleSelect?: (id: string) => void
-  filteredVehicles?: Map<string, unknown>
+  region: Region | 'all'
+  selectedVehicleId: string | null
+  onSelect: (id: string | null) => void
 }
 
-function buildIcon(status: string, heading: number, selected: boolean) {
-  if (!L) return undefined
-  const color = vehicleStatusColor[status as keyof typeof vehicleStatusColor] || '#6b7280'
-  const s = selected ? 22 : 15
-  const svg = `<svg width="${s*2}" height="${s*2}" viewBox="0 0 40 40" xmlns="http://www.w3.org/2000/svg">
-    <circle cx="20" cy="20" r="15" fill="${color}25" stroke="${color}" stroke-width="2"/>
-    ${selected ? `<circle cx="20" cy="20" r="14" fill="none" stroke="${color}" stroke-width="2.5" opacity="0.5"/>` : ''}
-    <circle cx="20" cy="20" r="6" fill="${color}"/>
-    <line x1="20" y1="20" x2="20" y2="7" stroke="${color}" stroke-width="2.5" stroke-linecap="round" transform="rotate(${heading} 20 20)"/>
-  </svg>`
-  return L.divIcon({ html: svg, className: '', iconSize: [s*2, s*2], iconAnchor: [s, s] })
+const REGION_VIEW: Record<Region, { center: [number, number]; zoom: number }> = {
+  'Mumbai MMR': { center: [19.1, 72.95], zoom: 11 },
+  'Delhi NCR': { center: [28.58, 77.2], zoom: 10 },
 }
 
-export default function FleetMap({ selectedVehicleId, onVehicleSelect, filteredVehicles }: Props) {
-  const mapRef = useRef<HTMLDivElement>(null)
-  const mapInstance = useRef<import('leaflet').Map | null>(null)
-  const markersRef = useRef<Map<string, import('leaflet').Marker>>(new Map())
-  const hasAutoFit = useRef(false)
-  const { vehicleMap } = useWSStore()
-  const [ready, setReady] = useState(false)
+/** Round heading into 15-degree buckets so we only re-draw the icon when it visibly turns. */
+function iconKey(v: LiveVehicle, selected: boolean): string {
+  const bucket = Math.round(((v.heading ?? 0) % 360) / 15)
+  return `${v.status}|${selected ? 1 : 0}|${bucket}`
+}
 
-  const displayMap = filteredVehicles ?? vehicleMap
+function buildIcon(status: LiveVehicle['status'], heading: number, selected: boolean): L.DivIcon {
+  const color = vehicleStatusColor[status] ?? '#6b7280'
+  const dim = status === 'maintenance' || status === 'offline'
+  const breakdown = status === 'breakdown'
+  const size = selected ? 30 : 20
+  const half = size / 2
+  const ring = selected
+    ? `box-shadow:0 0 0 3px ${color}66;`
+    : breakdown
+      ? `box-shadow:0 0 0 3px #ef444488;`
+      : ''
+  const html =
+    `<div style="width:${size}px;height:${size}px;${dim ? 'opacity:0.55;' : ''}position:relative;">` +
+      `<div style="position:absolute;inset:0;border-radius:50%;background:${color};border:2px solid #fff;${ring}"></div>` +
+      `<div style="position:absolute;left:50%;top:1px;width:2px;height:${half - 1}px;background:#fff;border-radius:1px;` +
+        `transform-origin:bottom center;transform:translateX(-50%) rotate(${heading}deg);"></div>` +
+    `</div>`
+  return L.divIcon({ html, className: 'fleet-marker', iconSize: [size, size], iconAnchor: [half, half] })
+}
 
-  // Init map
+function tooltipHtml(v: LiveVehicle): string {
+  const esc = (s: string) => s.replace(/[&<>]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c] ?? c))
+  const label = v.status.replace(/_/g, ' ')
+  const eta = v.eta_minutes != null ? `${Math.round(v.eta_minutes)} min` : '—'
+  return (
+    `<div style="font:12px system-ui;min-width:150px">` +
+      `<div style="font-weight:700">${esc(v.name)}</div>` +
+      `<div style="color:#6b7280;text-transform:capitalize">${esc(label)}</div>` +
+      `<div>Speed ${v.speed.toFixed(0)} km/h · Fuel ${v.fuel_level.toFixed(0)}%</div>` +
+      `<div>ETA ${eta}</div>` +
+    `</div>`
+  )
+}
+
+export default function FleetMap({ region, selectedVehicleId, onSelect }: Props) {
+  const containerRef = useRef<HTMLDivElement>(null)
+  const mapRef = useRef<L.Map | null>(null)
+  const markersRef = useRef<Map<string, { marker: L.Marker; iconKey: string }>>(new Map())
+  const fittedRegionRef = useRef<Region | 'all' | null>(null)
+
+  const vehicleMap = useWSStore(s => s.vehicleMap)
+
+  // keep latest onSelect without re-initialising the map
+  const onSelectRef = useRef(onSelect)
+  onSelectRef.current = onSelect
+
+  // ── Init map (guard against StrictMode double-mount) ──────────────────────────
   useEffect(() => {
-    let cancelled = false
-    ;(async () => {
-      const lf = await import('leaflet')
-      await import('leaflet/dist/leaflet.css')
-      L = (lf.default ?? lf) as typeof import('leaflet')
-      if (cancelled || !mapRef.current || mapInstance.current) return
+    if (mapRef.current || !containerRef.current) return
+    const map = L.map(containerRef.current, {
+      center: REGION_VIEW['Mumbai MMR'].center,
+      zoom: REGION_VIEW['Mumbai MMR'].zoom,
+      zoomControl: true,
+      attributionControl: true,
+    })
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      attribution: '&copy; OpenStreetMap contributors',
+      maxZoom: 19,
+    }).addTo(map)
+    map.on('click', () => onSelectRef.current(null))
+    mapRef.current = map
 
-      const map = L.map(mapRef.current, {
-        center: [22.5, 78.5],  // India center
-        zoom: 5,
-        zoomControl: true,
-        attributionControl: true,
-      })
-      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-        attribution: '© OpenStreetMap',
-        maxZoom: 18,
-      }).addTo(map)
-
-      mapInstance.current = map
-      setReady(true)
-    })()
-    return () => { cancelled = true }
+    const markers = markersRef.current
+    return () => {
+      map.remove()
+      mapRef.current = null
+      markers.clear()
+      fittedRegionRef.current = null
+    }
   }, [])
 
-  // Update markers on each frame
+  // ── Fit view when region changes (and on first data for 'all') ────────────────
   useEffect(() => {
-    if (!ready || !mapInstance.current || !L) return
-    const map = mapInstance.current
+    const map = mapRef.current
+    if (!map) return
 
-    const points: VehiclePoint[] = []
+    if (region === 'all') {
+      // fit all vehicles once we have them
+      if (fittedRegionRef.current === 'all') return
+      const pts: L.LatLngTuple[] = []
+      vehicleMap.forEach(v => { if (v.lat && v.lng) pts.push([v.lat, v.lng]) })
+      if (pts.length === 0) return
+      map.fitBounds(L.latLngBounds(pts), { padding: [50, 50], maxZoom: 11 })
+      fittedRegionRef.current = 'all'
+    } else {
+      if (fittedRegionRef.current === region) return
+      const { center, zoom } = REGION_VIEW[region]
+      map.setView(center, zoom, { animate: true })
+      fittedRegionRef.current = region
+    }
+  }, [region, vehicleMap])
 
-    displayMap.forEach((raw, id) => {
-      const v = raw as VehiclePoint
-      if (!v.lat || !v.lng) return
-      points.push(v)
+  // ── Sync markers each tick ────────────────────────────────────────────────────
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map) return
 
+    const inRegion = (v: LiveVehicle) => region === 'all' || v.region === region
+    const live = new Set<string>()
+
+    vehicleMap.forEach((v, id) => {
+      if (!inRegion(v) || !v.lat || !v.lng) return
+      live.add(id)
       const selected = id === selectedVehicleId
-      const icon = buildIcon(v.status, v.heading || 0, selected)
-      if (!icon) return
+      const key = iconKey(v, selected)
+      const existing = markersRef.current.get(id)
 
-      const tip = `<div style="font-family:system-ui;font-size:12px;min-width:150px;padding:2px 0">
-        <strong>${v.name}</strong>${v.region ? ` <span style="font-size:10px;color:#6b7280">${v.region}</span>` : ''}<br/>
-        <span style="color:#6b7280">${v.status.replace(/_/g,' ')} · ${v.speed.toFixed(0)} km/h</span><br/>
-        Fuel: <strong>${v.fuel_level.toFixed(0)}%</strong>
-        ${v.eta_minutes ? `<br/>ETA: <strong>${v.eta_minutes.toFixed(0)} min</strong>` : ''}
-      </div>`
-
-      if (markersRef.current.has(id)) {
-        const mk = markersRef.current.get(id)!
-        mk.setLatLng([v.lat, v.lng])
-        mk.setIcon(icon)
-        if ((mk as any)._tooltip) mk.setTooltipContent(tip)
+      if (existing) {
+        existing.marker.setLatLng([v.lat, v.lng])
+        if (existing.iconKey !== key) {
+          existing.marker.setIcon(buildIcon(v.status, v.heading ?? 0, selected))
+          existing.iconKey = key
+        }
+        existing.marker.setTooltipContent(tooltipHtml(v))
       } else {
-        const mk = L!.marker([v.lat, v.lng], { icon })
+        const marker = L.marker([v.lat, v.lng], { icon: buildIcon(v.status, v.heading ?? 0, selected) })
           .addTo(map)
-          .on('click', () => onVehicleSelect?.(id))
-        mk.bindTooltip(tip, { direction: 'top', offset: [0, -12] })
-        markersRef.current.set(id, mk)
+          .bindTooltip(tooltipHtml(v), { direction: 'top', offset: [0, -12], opacity: 0.95 })
+        marker.on('click', (e) => {
+          L.DomEvent.stopPropagation(e)
+          onSelectRef.current(id)
+        })
+        markersRef.current.set(id, { marker, iconKey: key })
       }
     })
 
-    // Remove gone markers
-    markersRef.current.forEach((mk, id) => {
-      if (!displayMap.has(id)) { mk.remove(); markersRef.current.delete(id) }
+    // drop markers no longer visible
+    markersRef.current.forEach((entry, id) => {
+      if (!live.has(id)) {
+        entry.marker.remove()
+        markersRef.current.delete(id)
+      }
     })
+  }, [vehicleMap, region, selectedVehicleId])
 
-    // Auto-fit to show ALL vehicles (both Mumbai + Delhi) on first load
-    if (!hasAutoFit.current && points.length > 5) {
-      hasAutoFit.current = true
-      const lats = points.map(p => p.lat)
-      const lngs = points.map(p => p.lng)
-      const minLat = Math.min(...lats), maxLat = Math.max(...lats)
-      const minLng = Math.min(...lngs), maxLng = Math.max(...lngs)
-      // Add padding so markers aren't at edge
-      map.fitBounds(
-        [[minLat - 0.5, minLng - 0.5], [maxLat + 0.5, maxLng + 0.5]],
-        { padding: [50, 50], maxZoom: 11 }
-      )
-    }
-  }, [displayMap, ready, selectedVehicleId, onVehicleSelect])
-
-  // Pan to selected
+  // ── Gently pan to the selected vehicle (no forced zoom-out) ──────────────────
   useEffect(() => {
-    if (!ready || !mapInstance.current || !selectedVehicleId) return
-    const v = displayMap.get(selectedVehicleId) as VehiclePoint | undefined
+    const map = mapRef.current
+    if (!map || !selectedVehicleId) return
+    const v = vehicleMap.get(selectedVehicleId)
     if (v?.lat && v?.lng) {
-      mapInstance.current.setView([v.lat, v.lng], Math.max(mapInstance.current.getZoom(), 13), { animate: true })
+      map.panTo([v.lat, v.lng], { animate: true })
     }
-  }, [selectedVehicleId, ready, displayMap])
+    // only pan when the selection itself changes
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedVehicleId])
 
-  const mumbaiCount = Array.from(vehicleMap.values()).filter(v => (v as VehiclePoint).region === 'Mumbai MMR').length
-  const delhiCount  = Array.from(vehicleMap.values()).filter(v => (v as VehiclePoint).region === 'Delhi NCR').length
-
-  return (
-    <div style={{ position: 'relative', width: '100%', height: '100%' }}>
-      <div ref={mapRef} style={{ width: '100%', height: '100%' }} />
-
-      {/* Legend */}
-      <div style={{ position:'absolute', bottom:20, left:12, zIndex:1000, background:'rgba(255,255,255,0.96)', border:'1px solid #dce5f5', borderRadius:8, padding:'10px 14px', boxShadow:'0 2px 8px rgba(15,28,63,0.10)' }}>
-        <div style={{ fontSize:10, fontWeight:700, color:'#7a90b8', letterSpacing:'0.08em', marginBottom:8 }}>REGIONS</div>
-        {[['Mumbai MMR','#f97316', mumbaiCount], ['Delhi NCR','#7c3aed', delhiCount]].map(([r,col,cnt])=>(
-          <div key={String(r)} style={{ display:'flex', alignItems:'center', gap:7, marginBottom:5, fontSize:11 }}>
-            <div style={{ width:8, height:8, borderRadius:'50%', background:String(col), flexShrink:0 }}/>
-            <span style={{ color:'#3d5280', flex:1 }}>{String(r)}</span>
-            <span style={{ fontWeight:700, color:'#0f1c3f' }}>{String(cnt)}</span>
-          </div>
-        ))}
-        <div style={{ borderTop:'1px solid #eaf0fb', marginTop:8, paddingTop:8 }}>
-          <div style={{ fontSize:10, fontWeight:700, color:'#7a90b8', letterSpacing:'0.08em', marginBottom:6 }}>STATUS</div>
-          {[['En Route','#2563eb'],['Available','#059669'],['Loading/Unloading','#d97706'],['Breakdown','#dc2626'],['Maintenance','#7c3aed']].map(([l,c])=>(
-            <div key={l} style={{ display:'flex', alignItems:'center', gap:6, marginBottom:3, fontSize:10, color:'#3d5280' }}>
-              <div style={{ width:7, height:7, borderRadius:'50%', background:c, flexShrink:0 }}/>{l}
-            </div>
-          ))}
-        </div>
-      </div>
-
-      {/* Vehicle count */}
-      <div style={{ position:'absolute', top:52, right:10, zIndex:1000, background:'rgba(255,255,255,0.96)', border:'1px solid #dce5f5', borderRadius:6, padding:'4px 10px', fontSize:11, color:'#3d5280', boxShadow:'0 1px 4px rgba(15,28,63,0.08)' }}>
-        {displayMap.size} / {vehicleMap.size} vehicles
-      </div>
-    </div>
-  )
+  return <div ref={containerRef} className="h-full w-full" />
 }

@@ -44,19 +44,19 @@
 
 ---
 
-## ADR-004: OR-Tools for Vehicle Routing
+## ADR-004: Hungarian assignment (SciPy) for dispatch
 
-**Decision:** Use Google OR-Tools for the optimization engine core.
+**Decision:** Dispatch is a one-to-one order-to-vehicle assignment solved with `scipy.optimize.linear_sum_assignment`. It is not a multi-stop VRP, and OR-Tools is not used.
 
 **Reasons:**
-- Production-grade CVRPTW (Capacitated VRP with Time Windows) solver used by Google Maps
-- Handles pickup-delivery pairs with capacity constraints in milliseconds
-- Open source (Apache 2.0), no API cost or rate limits
-- Local search metaheuristics (GLS) find near-optimal solutions within the 2-second time budget
+- Each vehicle carries one order at a time in the simulation, so assignment is the real decision; VRP machinery would be solving a problem the system does not have
+- The Hungarian algorithm gives the optimal assignment for the cost matrix in milliseconds
+- Hard constraints (region, capacity, cold chain, fuel range) are applied as infeasible pairs; soft factors and a priority bonus shape the cost
+- SciPy is already a dependency, so there is no heavy native package to ship
 
-**Trade-offs:** Larger binary than a hand-rolled greedy; requires integer-scaled distance matrix.
+**Honest baseline:** Each run also computes what a first-come-first-served, nearest-feasible-vehicle dispatcher would have done. The reported improvement is the measured difference in pickup distance/time between the two plans. It is often 0%, and that is shown as is.
 
-**Fallback:** Greedy best-fit scorer runs when OR-Tools isn't available or problem size is trivial (< 2 orders).
+**Trade-offs:** No route sequencing across several stops, no time-window optimisation. If vehicles ever carry multiple orders, revisit this (OR-Tools would then be the natural choice).
 
 ---
 
@@ -80,7 +80,7 @@
 **Decision:** Package the backend as a Docker container.
 
 **Reasons:**
-- OR-Tools, NumPy, and scikit-learn have complex native dependencies — Docker guarantees a consistent build
+- NumPy, SciPy, XGBoost and scikit-learn have native dependencies — Docker guarantees a consistent build
 - The `python:3.11-slim` base keeps the image under 600MB
 - Health check endpoint (`/health`) integrates with Docker Compose's `condition: service_healthy`
 - Non-root user (`appuser`) follows the principle of least privilege
@@ -94,8 +94,8 @@
 
 **Reasons:**
 - No API key required — the project runs immediately after `git clone`
-- OpenStreetMap tiles are free and sufficient for a demo at Mumbai MMR scale
-- Dark tile styling via CSS `filter: brightness(0.65) saturate(0.5) hue-rotate(200deg)` approximates a dark map
+- OpenStreetMap tiles are free and sufficient for a demo at city scale
+- Standard OpenStreetMap tiles are used as is (light theme, matching the UI)
 - `react-leaflet` integrates naturally with React's render cycle
 
 **Trade-offs:** No 3D buildings, no custom vector tile styling, tile loading can flicker on slow connections.
@@ -120,29 +120,32 @@
 
 ---
 
-## ADR-009: India/Mumbai as Operating Geography
+## ADR-009: India (Mumbai MMR and Delhi NCR) as Operating Geography
 
-**Decision:** Set the fleet simulation in Mumbai, India (not London or a generic city).
+**Decision:** Set the fleet simulation in two Indian regions, Mumbai MMR (44 vehicles) and Delhi NCR (34 vehicles).
 
 **Reasons:**
 - Adds specificity and narrative authenticity to the demo
-- Mumbai traffic patterns are distinctive (peak hours 8–11am, 6–9pm, monsoon delays)
-- Indian logistics is a high-growth sector — realistic for interview context
+- Peak-hour traffic patterns are distinctive (8–11am, 6–9pm, IST)
 - Vehicle names (ACE, LPT, Bolero) and company names (Reliance Retail, BigBasket, Delhivery) are recognisable
-- 25 Mumbai MMR zones provide geographic spread within a realistic operating radius
+- Two regions make the region constraint meaningful: a vehicle never serves an order in the other region, and cross-region orders are rejected at creation
+- Day boundaries and the hourly analytics use IST; timestamps are stored and sent as UTC
+
+**Trade-offs:** Region membership is derived from coordinates (longitude), so adding a third region needs a real lookup.
 
 ---
 
 ## ADR-010: ML at Startup (not deferred)
 
-**Decision:** Train all ML models synchronously at application startup.
+**Decision:** Train all ML models at application startup, in a background task.
 
 **Reasons:**
-- Training on 5,000 synthetic samples takes ~2 seconds — acceptable startup cost
-- No external ML infrastructure required (no MLflow, no model store)
-- Models are immediately available for prediction from the first API request
-- Synthetic training data is deterministic (fixed random seeds) — results are reproducible
+- Training on a few thousand synthetic samples is quick, and no external ML infrastructure is needed (no MLflow, no model store)
+- Core operations (simulation, dispatch) don't depend on the models, so the API serves requests immediately; prediction endpoints return `503` until training finishes
+- Synthetic training data uses fixed random seeds — results are reproducible
+- The data is synthetic, so reported MAE/RMSE describe that synthetic world, not real-world accuracy
+- The ETA model has monotone constraints so that more traffic never lowers an estimate
 
-**Trade-offs:** Longer startup time; models can't be updated without restart.
+**Trade-offs:** Models can't be updated without restart; predictions are unavailable for the first seconds after boot.
 
 **Production path:** Serialize trained models with `joblib`, load from disk on startup, retrain on a schedule.

@@ -1,194 +1,127 @@
 @import "tailwindcss";
 
+/* ── Design tokens: every colour used in the UI comes from here ─────────────── */
+@theme {
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', 'Fira Code', ui-monospace, monospace;
+
+  --color-canvas: #f4f6fb;
+  --color-surface: #ffffff;
+  --color-subtle: #f8fafc;
+  --color-hover: #eff3f9;
+  --color-line: #e3e8f1;
+
+  --color-ink: #0f1c3f;
+  --color-ink-2: #46567a;
+  --color-ink-3: #8190ad;
+
+  --color-brand: #2563eb;
+  --color-brand-dim: #1d4ed8;
+  --color-brand-soft: #eef4ff;
+  --color-ok: #059669;
+  --color-ok-soft: #ecfdf5;
+  --color-warn: #d97706;
+  --color-warn-soft: #fffbeb;
+  --color-bad: #dc2626;
+  --color-bad-soft: #fef2f2;
+  --color-violet: #7c3aed;
+  --color-cyan: #0891b2;
+
+  --shadow-card: 0 1px 2px rgba(15, 28, 63, 0.05);
+  --shadow-pop: 0 8px 28px rgba(15, 28, 63, 0.14), 0 2px 6px rgba(15, 28, 63, 0.06);
+}
+
 @layer base {
-  :root {
-    /* ── Background hierarchy ─────────────────────────────── */
-    --bg-base:     #f0f4fa;   /* page background — light blue-grey */
-    --bg-surface:  #ffffff;   /* sidebar, top bar */
-    --bg-elevated: #f7f9fd;   /* cards, table headers */
-    --bg-card:     #ffffff;   /* card backgrounds */
-    --bg-hover:    #e8eef8;   /* hover states */
-
-    /* ── Borders ──────────────────────────────────────────── */
-    --border:        #dce5f5;
-    --border-subtle: #eaf0fb;
-
-    /* ── Text ─────────────────────────────────────────────── */
-    --text-primary:   #0f1c3f;  /* near-black navy */
-    --text-secondary: #3d5280;  /* medium navy */
-    --text-muted:     #7a90b8;  /* muted blue-grey */
-    --text-inverse:   #ffffff;
-
-    /* ── Brand / Accent ───────────────────────────────────── */
-    --accent-blue:    #2563eb;
-    --accent-blue-dim:#1d4ed8;
-    --accent-cyan:    #0891b2;
-    --accent-emerald: #059669;
-    --accent-amber:   #d97706;
-    --accent-orange:  #ea580c;
-    --accent-red:     #dc2626;
-    --accent-purple:  #7c3aed;
-
-    /* ── Status colours ───────────────────────────────────── */
-    --status-available:   #059669;
-    --status-en-route:    #2563eb;
-    --status-idle:        #6b7280;
-    --status-loading:     #d97706;
-    --status-unloading:   #ea580c;
-    --status-maintenance: #7c3aed;
-    --status-breakdown:   #dc2626;
-    --status-offline:     #9ca3af;
-
-    --priority-low:      #6b7280;
-    --priority-normal:   #2563eb;
-    --priority-high:     #d97706;
-    --priority-critical: #dc2626;
-
-    --severity-low:      #059669;
-    --severity-medium:   #d97706;
-    --severity-high:     #ea580c;
-    --severity-critical: #dc2626;
-
-    --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
-    --radius:    6px;
-    --radius-lg: 10px;
-
-    /* ── Shadows ──────────────────────────────────────────── */
-    --shadow-sm:  0 1px 3px rgba(15,28,63,0.08), 0 1px 2px rgba(15,28,63,0.04);
-    --shadow-md:  0 4px 12px rgba(15,28,63,0.10), 0 2px 4px rgba(15,28,63,0.06);
-    --shadow-lg:  0 8px 24px rgba(15,28,63,0.12), 0 4px 8px rgba(15,28,63,0.06);
-  }
-
   * { box-sizing: border-box; }
 
-  html, body {
-    background-color: var(--bg-base);
-    color: var(--text-primary);
-    font-family: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+  html, body, #root {
+    height: 100%;
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-canvas);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
     font-size: 14px;
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
-    -moz-osx-font-smoothing: grayscale;
-    overflow-x: hidden;
   }
 
-  /* Scrollbars */
-  ::-webkit-scrollbar { width: 5px; height: 5px; }
-  ::-webkit-scrollbar-track { background: var(--bg-elevated); }
-  ::-webkit-scrollbar-thumb { background: #c5d2e8; border-radius: 3px; }
-  ::-webkit-scrollbar-thumb:hover { background: #9eb0cc; }
+  h1, h2, h3, p { margin: 0; }
 
-  /* Leaflet dark tile overlay for contrast on light bg */
-  .leaflet-container { background: #e8eef8 !important; font-family: inherit !important; }
-  .leaflet-tile { filter: saturate(0.85) brightness(1.02) !important; }
-  .leaflet-control-zoom a {
-    background: #ffffff !important;
-    color: var(--text-primary) !important;
-    border-color: var(--border) !important;
-    box-shadow: var(--shadow-sm) !important;
-  }
-  .leaflet-control-attribution {
-    background: rgba(255,255,255,0.85) !important;
-    color: var(--text-muted) !important;
-    font-size: 10px !important;
-  }
+  ::-webkit-scrollbar { width: 6px; height: 6px; }
+  ::-webkit-scrollbar-thumb { background: #c9d3e6; border-radius: 3px; }
+  ::-webkit-scrollbar-thumb:hover { background: #a3b3d0; }
+
+  :focus-visible { outline: 2px solid var(--color-brand); outline-offset: 2px; }
+
+  button { font-family: inherit; }
 }
 
 @layer components {
   .card {
-    background: var(--bg-card);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
-    box-shadow: var(--shadow-sm);
+    background: var(--color-surface);
+    border: 1px solid var(--color-line);
+    border-radius: 10px;
+    box-shadow: var(--shadow-card);
   }
 
-  .card-elevated {
-    background: var(--bg-elevated);
-    border: 1px solid var(--border);
-    border-radius: var(--radius-lg);
+  .btn {
+    display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+    height: 32px; padding: 0 12px;
+    border-radius: 7px; border: 1px solid transparent;
+    font-size: 13px; font-weight: 600; white-space: nowrap; cursor: pointer;
+    transition: background-color .12s, border-color .12s, box-shadow .12s;
+  }
+  .btn:disabled { opacity: .5; cursor: not-allowed; }
+  .btn-primary { background: var(--color-brand); color: #fff; }
+  .btn-primary:hover:not(:disabled) { background: var(--color-brand-dim); }
+  .btn-ghost { background: var(--color-surface); color: var(--color-ink-2); border-color: var(--color-line); }
+  .btn-ghost:hover:not(:disabled) { background: var(--color-hover); color: var(--color-ink); }
+  .btn-danger { background: var(--color-bad-soft); color: var(--color-bad); border-color: #fbd0cc; }
+  .btn-danger:hover:not(:disabled) { background: #fde3e0; }
+  .btn-sm { height: 28px; padding: 0 10px; font-size: 12px; }
+
+  .input {
+    height: 32px; padding: 0 10px; width: 100%;
+    background: var(--color-surface); color: var(--color-ink);
+    border: 1px solid var(--color-line); border-radius: 7px;
+    font-size: 13px; font-family: inherit;
+  }
+  .input:focus { outline: none; border-color: var(--color-brand); box-shadow: 0 0 0 3px rgba(37, 99, 235, .12); }
+  textarea.input { height: auto; padding: 8px 10px; }
+
+  .label {
+    display: block; margin-bottom: 4px;
+    font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase;
+    color: var(--color-ink-3);
   }
 
-  .btn-primary {
-    background: var(--accent-blue);
-    color: white;
-    border: none;
-    border-radius: var(--radius);
-    padding: 8px 16px;
-    font-size: 13px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: all 0.15s;
-    box-shadow: 0 1px 3px rgba(37,99,235,0.3);
+  .table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  .table th {
+    position: sticky; top: 0; z-index: 1;
+    padding: 8px 12px; text-align: left; white-space: nowrap;
+    background: var(--color-subtle); border-bottom: 1px solid var(--color-line);
+    font-size: 11px; font-weight: 600; letter-spacing: .05em; text-transform: uppercase; color: var(--color-ink-3);
   }
-  .btn-primary:hover { background: var(--accent-blue-dim); box-shadow: 0 2px 6px rgba(37,99,235,0.35); }
-  .btn-primary:active { transform: scale(0.98); }
-  .btn-primary:disabled { opacity: 0.55; cursor: not-allowed; }
+  .table td { padding: 9px 12px; border-bottom: 1px solid var(--color-line); vertical-align: middle; }
+  .table tbody tr:hover { background: var(--color-subtle); }
+  .table tbody tr.is-selected { background: var(--color-brand-soft); }
+  .table tbody tr.is-clickable { cursor: pointer; }
 
-  .btn-ghost {
-    background: transparent;
-    color: var(--text-secondary);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 6px 12px;
-    font-size: 13px;
-    font-weight: 500;
-    cursor: pointer;
-    transition: all 0.15s;
-  }
-  .btn-ghost:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-    border-color: #b8ccec;
-  }
-  .btn-ghost:disabled { opacity: 0.5; cursor: not-allowed; }
-
-  .badge {
-    display: inline-flex;
-    align-items: center;
-    gap: 4px;
-    padding: 2px 8px;
-    border-radius: 100px;
-    font-size: 11px;
-    font-weight: 600;
-    letter-spacing: 0.02em;
-    text-transform: uppercase;
-  }
-
-  .stat-value {
-    font-size: 28px;
-    font-weight: 700;
-    letter-spacing: -0.02em;
-    color: var(--text-primary);
-  }
-
-  .stat-label {
-    font-size: 10px;
-    font-weight: 600;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.09em;
-  }
-
-  .section-title {
-    font-size: 11px;
-    font-weight: 700;
-    color: var(--text-muted);
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-  }
-
-  .mono {
-    font-family: var(--font-mono);
-    font-size: 12px;
-  }
-
-  /* Live pulse */
   .pulse-live { animation: pulse-live 2s infinite; }
-  @keyframes pulse-live {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.35; }
-  }
+  @keyframes pulse-live { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
 
-  /* Table rows */
-  .table-row-hover:hover { background: var(--bg-hover) !important; }
+  .skeleton {
+    background: linear-gradient(90deg, #eef2f8 25%, #e4eaf4 37%, #eef2f8 63%);
+    background-size: 400% 100%; animation: skeleton 1.4s ease infinite; border-radius: 6px;
+  }
+  @keyframes skeleton { 0% { background-position: 100% 50%; } 100% { background-position: 0 50%; } }
 }
+
+/* Leaflet */
+.leaflet-container { background: #e8eef8 !important; font-family: inherit !important; }
+.leaflet-control-zoom a { color: var(--color-ink) !important; }
+.leaflet-tooltip { border-radius: 8px; border: 1px solid var(--color-line); box-shadow: var(--shadow-pop); padding: 6px 9px; }
+.fleet-marker { background: transparent !important; border: none !important; }

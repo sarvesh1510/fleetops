@@ -97,8 +97,14 @@ export function formatPercent(val: number): string {
   return `${val.toFixed(1)}%`
 }
 
-export function timeAgo(isoStr: string): string {
-  const diff = Date.now() - new Date(isoStr).getTime()
+/** The API returns naive UTC timestamps (no 'Z'); treat them as UTC, not browser-local. */
+export function parseApiDate(iso: string): Date {
+  return new Date(/(Z|[+-]\d{2}:?\d{2})$/i.test(iso) ? iso : `${iso}Z`)
+}
+
+export function timeAgo(isoStr: string | null | undefined): string {
+  if (!isoStr) return '—'
+  const diff = Math.max(0, Date.now() - parseApiDate(isoStr).getTime())
   const s = Math.floor(diff / 1000)
   if (s < 60) return `${s}s ago`
   const m = Math.floor(s / 60)
@@ -110,8 +116,15 @@ export function timeAgo(isoStr: string): string {
 
 export function formatDateTime(isoStr: string | null | undefined): string {
   if (!isoStr) return '—'
-  return new Date(isoStr).toLocaleString('en-IN', {
-    day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
+  return parseApiDate(isoStr).toLocaleString('en-IN', {
+    day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata',
+  })
+}
+
+export function formatTime(isoStr: string | null | undefined): string {
+  if (!isoStr) return '—'
+  return parseApiDate(isoStr).toLocaleTimeString('en-IN', {
+    hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata',
   })
 }
 
@@ -127,6 +140,44 @@ export const vehicleTypeLabel: Record<string, string> = {
 // ── Class name helper ──────────────────────────────────────────────────────────
 export function cx(...args: (string | false | null | undefined)[]): string {
   return args.filter(Boolean).join(' ')
+}
+
+export const incidentTypeLabel: Record<string, string> = {
+  vehicle_breakdown: 'Breakdown',
+  low_fuel: 'Low fuel',
+  low_battery: 'Low battery',
+  route_deviation: 'Route deviation',
+  traffic_spike: 'Traffic surge',
+  delivery_sla_risk: 'SLA risk',
+  prolonged_stop: 'Prolonged stop',
+  overload: 'Overload',
+  driver_unreachable: 'Driver unreachable',
+  vehicle_stopped: 'Vehicle stopped',
+}
+
+export const triggerLabel: Record<string, string> = {
+  scheduled: 'Scheduled',
+  new_order: 'New order',
+  vehicle_breakdown: 'Breakdown',
+  traffic_change: 'Traffic change',
+  manual: 'Manual',
+  sla_risk: 'SLA risk',
+}
+
+/** "1.2k" / "3.4L" style INR for compact tiles. */
+export function formatInr(amount: number | null | undefined): string {
+  if (amount == null) return '—'
+  return formatCurrency(amount, '₹')
+}
+
+export function formatNumber(n: number | null | undefined, digits = 0): string {
+  if (n == null) return '—'
+  return n.toLocaleString('en-IN', { minimumFractionDigits: digits, maximumFractionDigits: digits })
+}
+
+/** Percentage helper that tolerates null (renders an em dash). */
+export function formatPct(val: number | null | undefined, digits = 1): string {
+  return val == null ? '—' : `${val.toFixed(digits)}%`
 }
 
 // ── Health score color ─────────────────────────────────────────────────────────
