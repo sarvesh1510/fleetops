@@ -66,10 +66,18 @@ class Order(BaseModel):
     picked_up_at: Optional[datetime] = None
     delivered_at: Optional[datetime] = None
 
+    # Region the order belongs to ("Mumbai MMR" | "Delhi NCR"); dispatch never crosses regions
+    region: Optional[str] = None
+
     # ETA tracking
     estimated_delivery_at: Optional[datetime] = None
     eta_minutes: Optional[float] = None
+    # ETA (minutes, pickup + delivery legs) computed at assignment time, and the
+    # simulated minutes it actually took. Used for real ETA-accuracy analytics.
+    predicted_eta_minutes: Optional[float] = None
+    actual_duration_min: Optional[float] = None
     sla_at_risk: bool = False
+    reassignment_count: int = 0
 
     # Distance
     estimated_distance_km: Optional[float] = None

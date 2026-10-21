@@ -1,26 +1,30 @@
-from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel
+from datetime import datetime, timedelta
 from typing import Optional
+
 import structlog
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.core.auth import get_current_user, require_dispatcher_or_above
 from app.db.database import get_db
-from app.optimization.engine import optimization_engine, OptimizationTrigger
 from app.ml.models import ml_engine
+from app.models.optimization import OptimizationTrigger
+from app.optimization.engine import optimization_engine
 from app.simulation.engine import simulation_engine
+from app.utils.geo import ist_day_start_utc, ist_now
 
 logger = structlog.get_logger(__name__)
+
+# Rough operating cost used for the *estimate* shown on dashboards (INR per km driven)
+COST_PER_KM_INR = 22.0
+ANALYTICS_WINDOW_DAYS = 7
 
 # ── Optimization Router ───────────────────────────────────────────────────────
 opt_router = APIRouter(prefix="/optimization", tags=["optimization"])
 
 
 @opt_router.post("/run")
-async def trigger_optimization(
-    current_user: dict = Depends(require_dispatcher_or_above),
-    db=Depends(get_db),
-):
-    """Manually trigger a full fleet optimization pass."""
+async def trigger_optimization(current_user: dict = Depends(require_dispatcher_or_above)):
+    """Manually trigger a dispatch pass over all pending orders and available vehicles."""
     run = await optimization_engine.run(trigger=OptimizationTrigger.MANUAL)
     return run.model_dump()
 
@@ -29,11 +33,16 @@ async def trigger_optimization(
 async def list_optimization_runs(
     page: int = Query(1, ge=1),
     page_size: int = Query(20, ge=1, le=100),
+    trigger: Optional[str] = Query(None),
     current_user: dict = Depends(get_current_user),
     db=Depends(get_db),
 ):
-    total = await db.optimization_runs.count_documents({})
-    cursor = db.optimization_runs.find({}, {"_id": 0}).sort("created_at", -1).skip((page - 1) * page_size).limit(page_size)
+    query: dict = {}
+    if trigger and trigger != "all":
+        query["trigger"] = trigger
+    total = await db.optimization_runs.count_documents(query)
+    cursor = (db.optimization_runs.find(query, {"_id": 0}).sort("created_at", -1)
+              .skip((page - 1) * page_size).limit(page_size))
     docs = await cursor.to_list(length=page_size)
     return {
         "items": docs,
@@ -52,7 +61,6 @@ async def get_optimization_run(
 ):
     doc = await db.optimization_runs.find_one({"run_id": run_id}, {"_id": 0})
     if not doc:
-        from fastapi import HTTPException
         raise HTTPException(status_code=404, detail="Optimization run not found")
     return doc
 
@@ -62,21 +70,36 @@ async def optimization_stats(
     current_user: dict = Depends(get_current_user),
     db=Depends(get_db),
 ):
-    pipeline = [
+    totals = await db.optimization_runs.aggregate([
         {"$match": {"status": "completed"}},
         {"$group": {
             "_id": None,
             "total_runs": {"$sum": 1},
-            "avg_improvement_pct": {"$avg": "$improvement_pct"},
-            "total_distance_saved": {"$sum": "$distance_saved_km"},
-            "total_time_saved": {"$sum": "$time_saved_min"},
+            "total_assignments": {"$sum": "$assignments_changed"},
+            "total_distance_saved_km": {"$sum": {"$ifNull": ["$distance_saved_km", 0]}},
+            "total_time_saved_min": {"$sum": {"$ifNull": ["$time_saved_min", 0]}},
             "avg_solver_ms": {"$avg": "$solver_duration_ms"},
         }},
-    ]
-    results = await db.optimization_runs.aggregate(pipeline).to_list(1)
-    stats = results[0] if results else {}
-    stats.pop("_id", None)
-    return stats
+    ]).to_list(1)
+    # Average improvement only over runs that actually compared two plans
+    improvement = await db.optimization_runs.aggregate([
+        {"$match": {"status": "completed", "improvement_pct": {"$type": "number"}}},
+        {"$group": {"_id": None, "avg": {"$avg": "$improvement_pct"}, "n": {"$sum": 1}}},
+    ]).to_list(1)
+    by_trigger = {d["_id"]: d["count"] async for d in db.optimization_runs.aggregate(
+        [{"$group": {"_id": "$trigger", "count": {"$sum": 1}}}])}
+
+    t = totals[0] if totals else {}
+    return {
+        "total_runs": t.get("total_runs", 0),
+        "total_assignments": t.get("total_assignments", 0),
+        "avg_improvement_pct": round(improvement[0]["avg"], 1) if improvement else None,
+        "runs_with_comparison": improvement[0]["n"] if improvement else 0,
+        "total_distance_saved_km": round(t.get("total_distance_saved_km", 0.0), 1),
+        "total_time_saved_min": round(t.get("total_time_saved_min", 0.0), 1),
+        "avg_solver_ms": round(t["avg_solver_ms"], 1) if t.get("avg_solver_ms") is not None else None,
+        "by_trigger": by_trigger,
+    }
 
 
 # ── Analytics Router ──────────────────────────────────────────────────────────
@@ -88,54 +111,69 @@ async def analytics_overview(
     current_user: dict = Depends(get_current_user),
     db=Depends(get_db),
 ):
-    """High-level fleet KPIs for the analytics page."""
-    from datetime import datetime, timedelta
-    now = datetime.utcnow()
-    week_ago = now - timedelta(days=7)
+    """Fleet KPIs over the last 7 days of completed orders."""
+    since = datetime.utcnow() - timedelta(days=ANALYTICS_WINDOW_DAYS)
 
-    # Delivery performance
-    delivered = await db.orders.count_documents({"status": "delivered"})
-    failed = await db.orders.count_documents({"status": "failed"})
-    total_completed = delivered + failed
-    on_time_rate = round(delivered / max(total_completed, 1) * 100, 1)
+    agg = await db.orders.aggregate([
+        {"$match": {"status": {"$in": ["delivered", "failed"]}, "updated_at": {"$gte": since}}},
+        {"$group": {
+            "_id": None,
+            "delivered": {"$sum": {"$cond": [{"$eq": ["$status", "delivered"]}, 1, 0]}},
+            "failed": {"$sum": {"$cond": [{"$eq": ["$status", "failed"]}, 1, 0]}},
+            "on_time": {"$sum": {"$cond": [{"$and": [
+                {"$eq": ["$status", "delivered"]},
+                {"$lte": ["$delivered_at", {"$ifNull": ["$deadline", "$delivered_at"]}]},
+            ]}, 1, 0]}},
+            "total_dist": {"$sum": {"$ifNull": ["$actual_distance_km", 0]}},
+            "avg_minutes": {"$avg": "$actual_duration_min"},
+        }},
+    ]).to_list(1)
+    a = agg[0] if agg else {"delivered": 0, "failed": 0, "on_time": 0, "total_dist": 0.0, "avg_minutes": None}
+    completed = a["delivered"] + a["failed"]
 
-    # Distance and route stats
-    dist_pipeline = [
-        {"$match": {"status": "delivered", "actual_distance_km": {"$exists": True}}},
-        {"$group": {"_id": None, "avg_dist": {"$avg": "$actual_distance_km"}, "total_dist": {"$sum": "$actual_distance_km"}}},
-    ]
-    dist_result = await db.orders.aggregate(dist_pipeline).to_list(1)
-    avg_dist = round(dist_result[0]["avg_dist"], 1) if dist_result else 12.4
-    total_dist = round(dist_result[0]["total_dist"], 1) if dist_result else 0
+    eta = await db.orders.aggregate([
+        {"$match": {"status": "delivered", "updated_at": {"$gte": since},
+                    "predicted_eta_minutes": {"$gt": 0}, "actual_duration_min": {"$gt": 0}}},
+        {"$group": {
+            "_id": None,
+            "n": {"$sum": 1},
+            "mae": {"$avg": {"$abs": {"$subtract": ["$actual_duration_min", "$predicted_eta_minutes"]}}},
+            "ape": {"$avg": {"$divide": [
+                {"$abs": {"$subtract": ["$actual_duration_min", "$predicted_eta_minutes"]}},
+                "$predicted_eta_minutes"]}},
+        }},
+    ]).to_list(1)
 
-    # Fleet utilization
     vehicles = simulation_engine.get_all_vehicles()
     total_v = len(vehicles)
     active_v = sum(1 for v in vehicles if v.status.value in ("en_route", "loading", "unloading"))
-    fleet_util = round(active_v / max(total_v, 1) * 100, 1)
 
-    # Incidents
-    resolved = await db.incidents.count_documents({"status": "resolved"})
     total_incidents = await db.incidents.count_documents({})
+    resolved = await db.incidents.count_documents({"status": "resolved"})
 
-    # Cost estimate (simulated)
-    cost_per_km = 22.0  # ₹ per km estimate (diesel mini-truck, India)
-    estimated_cost = round(total_dist * cost_per_km, 0)
-
+    total_dist = round(a["total_dist"], 1)
+    estimated_cost = round(total_dist * COST_PER_KM_INR, 0)
     return {
-        "on_time_rate": on_time_rate,
-        "total_deliveries": total_completed,
-        "delivered": delivered,
-        "failed": failed,
-        "avg_route_distance_km": avg_dist,
+        "window_days": ANALYTICS_WINDOW_DAYS,
+        "on_time_rate": round(a["on_time"] / completed * 100, 1) if completed else None,
+        "total_deliveries": completed,
+        "delivered": a["delivered"],
+        "failed": a["failed"],
+        "avg_route_distance_km": round(total_dist / a["delivered"], 1) if a["delivered"] else None,
+        "avg_delivery_minutes": round(a["avg_minutes"], 1) if a["avg_minutes"] else None,
         "total_distance_km": total_dist,
-        "fleet_utilization_pct": fleet_util,
+        "fleet_utilization_pct": round(active_v / total_v * 100, 1) if total_v else 0.0,
         "active_vehicles": active_v,
         "total_vehicles": total_v,
         "total_incidents": total_incidents,
         "resolved_incidents": resolved,
+        "eta_samples": eta[0]["n"] if eta else 0,
+        "eta_mae_min": round(eta[0]["mae"], 1) if eta else None,
+        "eta_accuracy_pct": round(max(0.0, 1 - eta[0]["ape"]) * 100, 1) if eta else None,
+        # An estimate: distance driven x flat per-km operating cost
         "estimated_cost_inr": estimated_cost,
-        "cost_per_delivery_inr": round(estimated_cost / max(total_completed, 1), 0),
+        "cost_per_delivery_inr": round(estimated_cost / a["delivered"], 0) if a["delivered"] else None,
+        "cost_per_km_inr": COST_PER_KM_INR,
     }
 
 
@@ -144,52 +182,54 @@ async def deliveries_per_hour(
     current_user: dict = Depends(get_current_user),
     db=Depends(get_db),
 ):
-    """Deliveries completed per hour for today — used for bar chart."""
-    from datetime import datetime
-    now = datetime.utcnow()
-    start_of_day = now.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    pipeline = [
-        {"$match": {"status": "delivered", "delivered_at": {"$gte": start_of_day.isoformat()}}},
-        {"$addFields": {"hour": {"$substr": ["$delivered_at", 11, 2]}}},
-        {"$group": {"_id": "$hour", "count": {"$sum": 1}}},
-        {"$sort": {"_id": 1}},
+    """Deliveries completed per hour today (India time)."""
+    start_of_day = ist_day_start_utc()
+    results = await db.orders.aggregate([
+        {"$match": {"status": "delivered", "delivered_at": {"$gte": start_of_day}}},
+        {"$group": {
+            "_id": {"$hour": {"date": "$delivered_at", "timezone": "Asia/Kolkata"}},
+            "count": {"$sum": 1},
+            "late": {"$sum": {"$cond": [
+                {"$gt": ["$delivered_at", {"$ifNull": ["$deadline", "$delivered_at"]}]}, 1, 0]}},
+        }},
+    ]).to_list(24)
+    by_hour = {r["_id"]: r for r in results}
+    current_hour = ist_now().hour
+    return [
+        {
+            "hour": f"{h:02d}:00",
+            "deliveries": by_hour.get(h, {}).get("count", 0),
+            "late": by_hour.get(h, {}).get("late", 0),
+            "is_future": h > current_hour,
+        }
+        for h in range(24)
     ]
-    results = await db.orders.aggregate(pipeline).to_list(24)
-    hours = {r["_id"]: r["count"] for r in results}
-    return [{"hour": f"{h:02d}:00", "deliveries": hours.get(f"{h:02d}", 0)} for h in range(24)]
 
 
 @analytics_router.get("/eta-performance")
 async def eta_performance(
+    limit: int = Query(50, ge=1, le=200),
     current_user: dict = Depends(get_current_user),
     db=Depends(get_db),
 ):
-    """ETA accuracy — predicted vs actual delivery time."""
-    pipeline = [
-        {"$match": {
-            "status": "delivered",
-            "eta_minutes": {"$exists": True},
-            "picked_up_at": {"$exists": True},
-            "delivered_at": {"$exists": True},
-        }},
-        {"$limit": 200},
+    """Predicted vs actual delivery time for the most recent delivered orders (real recorded values)."""
+    cursor = db.orders.find(
+        {"status": "delivered", "predicted_eta_minutes": {"$gt": 0}, "actual_duration_min": {"$gt": 0}},
+        {"_id": 0, "reference": 1, "predicted_eta_minutes": 1, "actual_duration_min": 1, "delivered_at": 1},
+    ).sort("delivered_at", -1).limit(limit)
+    docs = await cursor.to_list(limit)
+    docs.reverse()  # oldest -> newest for charting
+    return [
+        {
+            "order_ref": d.get("reference", ""),
+            "predicted_min": round(d["predicted_eta_minutes"], 1),
+            "actual_min": round(d["actual_duration_min"], 1),
+            "variance_pct": round((d["actual_duration_min"] - d["predicted_eta_minutes"])
+                                  / d["predicted_eta_minutes"] * 100, 1),
+            "delivered_at": d.get("delivered_at"),
+        }
+        for d in docs
     ]
-    docs = await db.orders.aggregate(pipeline).to_list(200)
-
-    import random
-    # Build realistic comparison data
-    data = []
-    for doc in docs[:50]:
-        predicted = doc.get("eta_minutes", 30)
-        actual = predicted * random.uniform(0.8, 1.3)
-        data.append({
-            "order_ref": doc.get("reference", "")[-8:],
-            "predicted_min": round(predicted, 1),
-            "actual_min": round(actual, 1),
-            "variance_pct": round((actual - predicted) / max(predicted, 1) * 100, 1),
-        })
-    return data
 
 
 # ── ML/Predictions Router ─────────────────────────────────────────────────────
@@ -203,14 +243,15 @@ async def ml_status(current_user: dict = Depends(get_current_user)):
 
 @ml_router.post("/eta")
 async def predict_eta(
-    distance_km: float = 10.0,
-    speed_kmh: float = 35.0,
-    n_stops: int = 2,
-    traffic_factor: float = 1.0,
+    distance_km: float = Query(10.0, gt=0, le=200),
+    speed_kmh: float = Query(28.0, gt=5, le=120, description="Free-flow speed of the vehicle"),
+    n_stops: int = Query(2, ge=1, le=30),
+    traffic_factor: float = Query(1.0, ge=0.5, le=4.0, description="Congestion multiplier (1 = free flow)"),
     current_user: dict = Depends(get_current_user),
 ):
-    from datetime import datetime
-    now = datetime.utcnow()
+    if not ml_engine.eta_predictor.is_trained:
+        raise HTTPException(status_code=503, detail="ETA model is still training - try again in a few seconds")
+    now = ist_now()
     predicted, confidence = ml_engine.eta_predictor.predict(
         distance_km=distance_km,
         speed_kmh=speed_kmh,
@@ -219,29 +260,31 @@ async def predict_eta(
         n_stops=n_stops,
         traffic_factor=traffic_factor,
     )
+    spread = 1.28 * (ml_engine.eta_predictor.rmse or ml_engine.eta_predictor.mae or 0.0)
     return {
         "distance_km": distance_km,
         "speed_kmh": speed_kmh,
         "n_stops": n_stops,
         "traffic_factor": traffic_factor,
         "predicted_duration_minutes": predicted,
+        "range_min": round(max(predicted - spread, 1.0), 1),
+        "range_max": round(predicted + spread, 1),
         "confidence_pct": confidence,
-        "model": "eta_xgboost_v1",
+        "model": "eta_xgboost_v2",
     }
 
 
 @ml_router.get("/demand")
-async def predict_demand(
-    current_user: dict = Depends(get_current_user),
-):
-    from datetime import datetime
-    now = datetime.utcnow()
+async def predict_demand(current_user: dict = Depends(get_current_user)):
+    if not ml_engine.demand_forecaster.is_trained:
+        raise HTTPException(status_code=503, detail="Demand model is still training - try again in a few seconds")
+    now = ist_now()
     forecasts = ml_engine.demand_forecaster.predict_all_zones(now.hour, now.weekday())
     return {
         "hour": now.hour,
         "day_of_week": now.weekday(),
         "forecasts": forecasts,
-        "model": "demand_gbm_v1",
+        "model": "demand_gbm_v2",
     }
 
 

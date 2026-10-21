@@ -6,11 +6,16 @@ import random
 import uuid
 import math
 import bcrypt
-from datetime import datetime, timedelta
-from typing import List
+from datetime import datetime, timedelta, timezone
 import structlog
 
+from app.utils.cargo import random_cargo_weight
+from app.utils.geo import DELHI, IST, MUMBAI, haversine_km, region_for_lng
+
 logger = structlog.get_logger(__name__)
+
+# Bump when the persisted data model changes; triggers a rebuild of operational collections.
+SCHEMA_VERSION = 2
 
 def _hash(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
@@ -151,381 +156,247 @@ def rand_plate(state):
     return f"{state}-{dist}-{letters}-{num}"
 
 
-async def seed_database(db):
+async def seed_database(db) -> bool:
+    """
+    Seed demo data. Returns True if the database was (re)seeded.
+
+    Seeded data is intentionally limited to what a real deployment would already
+    have on day one: users, drivers, the fleet, and 7 days of completed-order
+    history. Incidents and optimization runs are NOT seeded - they are produced
+    by the running system.
+
+    A schema-version marker is stored in `meta`. When the version changes the
+    operational collections are rebuilt from scratch (users are re-created).
+    """
+    meta = await db.meta.find_one({"_id": "schema"})
     existing = await db.vehicles.count_documents({})
-    if existing > 10:
-        logger.info("Already seeded", vehicles=existing)
-        return None, None
-    logger.info("Seeding India fleet — Mumbai MMR + Delhi NCR")
+    if meta and meta.get("version") == SCHEMA_VERSION and existing > 10:
+        logger.info("Database already seeded", version=SCHEMA_VERSION, vehicles=existing)
+        return False
+
+    logger.info("Seeding database", version=SCHEMA_VERSION,
+                previous_version=(meta or {}).get("version"))
+    for col in ("vehicles", "drivers", "orders", "incidents", "optimization_runs",
+                "telemetry", "routes", "alerts", "audit_logs"):
+        await db[col].delete_many({})
+
     await _seed_users(db)
-    drivers = await _seed_drivers(db)
-    vehicles = await _seed_vehicles(db, drivers)
-    orders = await _seed_orders(db, vehicles)
-    await _seed_incidents(db, vehicles, orders)
-    await _seed_optimization_runs(db)
-    logger.info("Seeding complete", total_vehicles=len(vehicles))
-    return vehicles, orders
+    drivers, vehicles = await _seed_fleet(db)
+    await _seed_order_history(db, vehicles)
+    await db.meta.replace_one(
+        {"_id": "schema"},
+        {"_id": "schema", "version": SCHEMA_VERSION, "seeded_at": datetime.utcnow()},
+        upsert=True,
+    )
+    logger.info("Seeding complete", vehicles=len(vehicles), drivers=len(drivers))
+    return True
 
 
 async def _seed_users(db):
     await db.users.delete_many({})
     now = datetime.utcnow()
     users = [
-        {"user_id":"usr-admin-001","username":"admin","email":"admin@fleetops.in",
-         "full_name":"Arjun Mehta","role":"admin",
-         "hashed_password":_hash("***REMOVED***"),"is_active":True,"created_at":now,"updated_at":now},
-        {"user_id":"usr-ops-001","username":"ops_manager","email":"ops@fleetops.in",
-         "full_name":"Priya Sharma","role":"operations_manager",
-         "hashed_password":_hash("***REMOVED***"),"is_active":True,"created_at":now,"updated_at":now},
-        {"user_id":"usr-disp-001","username":"dispatcher","email":"dispatch@fleetops.in",
-         "full_name":"Rahul Verma","role":"dispatcher",
-         "hashed_password":_hash("***REMOVED***"),"is_active":True,"created_at":now,"updated_at":now},
-        {"user_id":"usr-view-001","username":"viewer","email":"viewer@fleetops.in",
-         "full_name":"Read-only Viewer","role":"viewer",
-         "hashed_password":_hash("***REMOVED***"),"is_active":True,"created_at":now,"updated_at":now},
+        {"user_id": "usr-admin-001", "username": "admin", "email": "admin@fleetops.in",
+         "full_name": "Arjun Mehta", "role": "admin",
+         "hashed_password": _hash("***REMOVED***"), "is_active": True, "created_at": now, "updated_at": now},
+        {"user_id": "usr-ops-001", "username": "ops_manager", "email": "ops@fleetops.in",
+         "full_name": "Priya Sharma", "role": "operations_manager",
+         "hashed_password": _hash("***REMOVED***"), "is_active": True, "created_at": now, "updated_at": now},
+        {"user_id": "usr-disp-001", "username": "dispatcher", "email": "dispatch@fleetops.in",
+         "full_name": "Rahul Verma", "role": "dispatcher",
+         "hashed_password": _hash("***REMOVED***"), "is_active": True, "created_at": now, "updated_at": now},
+        {"user_id": "usr-view-001", "username": "viewer", "email": "viewer@fleetops.in",
+         "full_name": "Read-only Viewer", "role": "viewer",
+         "hashed_password": _hash("***REMOVED***"), "is_active": True, "created_at": now, "updated_at": now},
     ]
     await db.users.insert_many(users)
     logger.info("Users seeded", count=len(users))
 
 
-async def _seed_drivers(db):
-    await db.drivers.delete_many({})
+# (id prefix, model pool, type, fuel options, capacity kg, count, zones)
+FLEET_CONFIG = [
+    ("mum-ace", TATA_ACE_VARIANTS,          "van",          ["diesel", "cng"],     800,  14, MUMBAI_ZONES),
+    ("mum-mah", MAHINDRA_VANS,              "van",          ["diesel", "cng"],     1200,  8, MUMBAI_ZONES),
+    ("mum-trk", TATA_TRUCKS,                "truck",        ["diesel"],            5000,  6, MUMBAI_ZONES),
+    ("mum-eic", EICHER_TRUCKS,              "truck",        ["diesel"],            8000,  3, MUMBAI_ZONES),
+    ("mum-ev",  ELECTRIC_BIKES,             "cargo_bike",   ["electric"],          120,   6, MUMBAI_ZONES),
+    ("mum-mto", MOTORCYCLES,                "motorcycle",   ["petrol"],            20,    4, MUMBAI_ZONES),
+    ("mum-ref", REFRIGERATED,               "refrigerated", ["diesel"],            2000,  3, MUMBAI_ZONES),
+    ("del-ace", TATA_ACE_VARIANTS,          "van",          ["diesel", "cng"],     800,  10, DELHI_NCR_ZONES),
+    ("del-mah", MAHINDRA_VANS + FORCE_MINI, "van",          ["diesel", "cng"],     1200,  6, DELHI_NCR_ZONES),
+    ("del-trk", TATA_TRUCKS + BHARAT_BENZ,  "truck",        ["diesel"],            6000,  5, DELHI_NCR_ZONES),
+    ("del-ash", ASHOK_LEYLAND_HT,           "truck",        ["diesel"],            9000,  3, DELHI_NCR_ZONES),
+    ("del-ev",  ELECTRIC_BIKES,             "cargo_bike",   ["electric"],          120,   4, DELHI_NCR_ZONES),
+    ("del-mto", MOTORCYCLES,                "motorcycle",   ["petrol", "electric"], 20,   4, DELHI_NCR_ZONES),
+    ("del-ref", REFRIGERATED,               "refrigerated", ["diesel"],            2500,  2, DELHI_NCR_ZONES),
+]
+
+
+async def _seed_fleet(db):
+    """Create vehicles and one driver per vehicle, linked both ways."""
     now = datetime.utcnow()
-    drivers = []
-    for i in range(60):
-        name = rand_driver_name()
-        state = random.choice(["MH","DL","UP","HR","KA","TN","GJ","RJ","MP","BR"])
-        drivers.append({
-            "driver_id": f"drv-{uuid.uuid4().hex[:8]}",
-            "full_name": name,
-            "license_number": rand_plate(state).replace("-",""),
-            "phone": f"+91 {random.randint(7000000000,9999999999)}",
-            "email": f"{name.lower().replace(' ','.')}{random.randint(1,99)}@gmail.com",
-            "vehicle_id": None,
-            "status": random.choices(["available","on_duty","break","off_duty"], weights=[22,58,10,10])[0],
-            "shift_start": (now - timedelta(hours=random.randint(1,8))).isoformat(),
-            "total_deliveries_today": random.randint(0, 18),
-            "rating": round(random.uniform(3.6, 5.0), 1),
-            "city": random.choice(["Mumbai","Delhi","Thane","Navi Mumbai","Noida","Gurgaon","Faridabad","Ghaziabad"]),
-            "created_at": now, "updated_at": now,
-        })
-    await db.drivers.insert_many(drivers)
-    logger.info("Drivers seeded", count=len(drivers))
-    return drivers
+    vehicles, drivers = [], []
 
-
-async def _seed_vehicles(db, drivers):
-    await db.vehicles.delete_many({})
-    now = datetime.utcnow()
-    vehicles = []
-    drv_idx = 0
-
-    fleet_config = [
-        # Mumbai fleet
-        ("mum-ace", TATA_ACE_VARIANTS,           "van",          ["diesel","cng"],  800,  14, MUMBAI_ZONES, [20,42,8,10,15,5]),
-        ("mum-mah", MAHINDRA_VANS,               "van",          ["diesel","cng"],  1200,  8, MUMBAI_ZONES, [18,45,8, 8,16,5]),
-        ("mum-trk", TATA_TRUCKS,                 "truck",        ["diesel"],        5000,  6, MUMBAI_ZONES, [12,52,8, 8,15,5]),
-        ("mum-eic", EICHER_TRUCKS,               "truck",        ["diesel"],        8000,  3, MUMBAI_ZONES, [10,55,8, 8,14,5]),
-        ("mum-ev",  ELECTRIC_BIKES,              "cargo_bike",   ["electric"],      120,   6, MUMBAI_ZONES, [28,42,8, 8,12,2]),
-        ("mum-mto", MOTORCYCLES,                 "motorcycle",   ["petrol"],         20,   4, MUMBAI_ZONES, [30,48,5, 5,10,2]),
-        ("mum-ref", REFRIGERATED,                "refrigerated", ["diesel"],        2000,  3, MUMBAI_ZONES, [10,55,8, 8,14,5]),
-        # Delhi NCR fleet
-        ("del-ace", TATA_ACE_VARIANTS,           "van",          ["diesel","cng"],  800,  10, DELHI_NCR_ZONES, [20,42,8,10,15,5]),
-        ("del-mah", MAHINDRA_VANS + FORCE_MINI,  "van",          ["diesel","cng"],  1200,  6, DELHI_NCR_ZONES, [18,45,8, 8,16,5]),
-        ("del-trk", TATA_TRUCKS + BHARAT_BENZ,   "truck",        ["diesel"],        6000,  5, DELHI_NCR_ZONES, [12,52,8, 8,15,5]),
-        ("del-ash", ASHOK_LEYLAND_HT,            "truck",        ["diesel"],        9000,  3, DELHI_NCR_ZONES, [10,55,8, 8,14,5]),
-        ("del-ev",  ELECTRIC_BIKES,              "cargo_bike",   ["electric"],      120,   4, DELHI_NCR_ZONES, [28,42,8, 8,12,2]),
-        ("del-mto", MOTORCYCLES,                 "motorcycle",   ["petrol","electric"], 15, 4, DELHI_NCR_ZONES, [30,48,5, 5,10,2]),
-        ("del-ref", REFRIGERATED,                "refrigerated", ["diesel"],        2500,  2, DELHI_NCR_ZONES, [10,55,8, 8,14,5]),
-    ]
-
-    for pfx, model_pool, vtype, fuels, max_cap, count, zone_pool, sw in fleet_config:
+    for pfx, model_pool, vtype, fuels, max_cap, count, zone_pool in FLEET_CONFIG:
         for i in range(count):
-            zone = random.choice(zone_pool)
-            z_name, z_lat, z_lng, z_state = zone
+            z_name, z_lat, z_lng, z_state = random.choice(zone_pool)
             lat, lng = rand_point(z_lat, z_lng)
-            model = random.choice(model_pool)
-            plate = rand_plate(z_state)
-            is_delhi = z_state in ("DL","UP","HR")
-            region = "Delhi NCR" if is_delhi else "Mumbai MMR"
-            city = random.choice(["Delhi","Noida","Gurgaon","Faridabad"] if is_delhi else ["Mumbai","Thane","Navi Mumbai","Kalyan"])
+            region = region_for_lng(lng)
+            city = random.choice(["Delhi", "Noida", "Gurgaon", "Faridabad"] if region == DELHI
+                                 else ["Mumbai", "Thane", "Navi Mumbai", "Kalyan"])
+            fuel_type = random.choice(fuels)
+            fuel = round(random.uniform(35, 100), 1)
+            vehicle_id = f"veh-{pfx}-{i:02d}"
+            driver_id = f"drv-{uuid.uuid4().hex[:8]}"
+            name = rand_driver_name()
+            state = z_state if z_state in ("MH", "DL", "UP", "HR") else "MH"
 
-            status = random.choices(
-                ["available","en_route","loading","unloading","idle","maintenance"],
-                weights=sw
-            )[0]
-            drv = drivers[drv_idx % len(drivers)] if drv_idx < len(drivers) else None
-            drv_idx += 1
-            fuel = round(random.uniform(18, 100), 1)
-            load = round(random.uniform(0, max_cap * 0.75), 1) if status in ("en_route","loading","unloading") else 0.0
-
+            drivers.append({
+                "driver_id": driver_id,
+                "full_name": name,
+                "license_number": rand_plate(state).replace("-", ""),
+                "phone": f"+91 {random.randint(7000000000, 9999999999)}",
+                "email": f"{name.lower().replace(' ', '.')}{random.randint(1, 99)}@example.in",
+                "vehicle_id": vehicle_id,
+                "status": "on_duty",
+                "shift_start": now - timedelta(hours=random.randint(1, 6)),
+                "total_deliveries_today": 0,
+                "rating": round(random.uniform(3.6, 5.0), 1),
+                "city": city,
+                "created_at": now, "updated_at": now,
+            })
+            # ~5% of the fleet starts in the workshop
+            status = "maintenance" if random.random() < 0.05 else "available"
             vehicles.append({
-                "vehicle_id": f"veh-{pfx}-{i:02d}",
-                "name": model,
-                "registration": plate,
+                "vehicle_id": vehicle_id,
+                "name": model_pool[i % len(model_pool)] if len(model_pool) > 1 else model_pool[0],
+                "registration": rand_plate(state),
                 "city": city,
                 "region": region,
                 "type": vtype,
-                "fuel_type": random.choice(fuels),
+                "fuel_type": fuel_type,
                 "status": status,
-                "driver_id": drv["driver_id"] if drv else None,
+                "driver_id": driver_id,
                 "location": make_geo(lat, lng),
                 "heading": round(random.uniform(0, 360), 1),
-                "speed": round(random.uniform(14, 42), 1) if status == "en_route" else 0.0,
+                "speed": 0.0,
                 "max_capacity_kg": max_cap,
-                "current_load_kg": load,
+                "current_load_kg": 0.0,
                 "fuel_level": fuel,
-                "fuel_range_km": round(fuel * (4.2 if vtype in ("van","truck","refrigerated") else 2.0), 1),
+                "fuel_range_km": round(fuel * (4.2 if vtype in ("van", "truck", "refrigerated") else 2.0), 1),
                 "current_order_id": None,
                 "current_route_id": None,
                 "health": {
-                    "engine_temp": round(random.uniform(80, 104), 1),
-                    "tire_pressure": round(random.uniform(85, 100), 1),
-                    "brake_health": round(random.uniform(65, 100), 1),
-                    "transmission_health": round(random.uniform(70, 100), 1),
-                    "overall_score": round(random.uniform(60, 100), 1),
+                    "engine_temp": round(random.uniform(80, 98), 1),
+                    "tire_pressure": round(random.uniform(88, 100), 1),
+                    "brake_health": round(random.uniform(70, 100), 1),
+                    "transmission_health": round(random.uniform(75, 100), 1),
+                    "overall_score": round(random.uniform(65, 100), 1),
                 },
-                "odometer_km": round(random.uniform(2000, 220000), 0),
+                "odometer_km": round(random.uniform(2000, 180000), 0),
                 "current_eta_minutes": None,
                 "created_at": now, "updated_at": now,
             })
 
+    await db.drivers.insert_many(drivers)
     await db.vehicles.insert_many(vehicles)
-    mum_c = sum(1 for v in vehicles if v["region"]=="Mumbai MMR")
-    del_c = sum(1 for v in vehicles if v["region"]=="Delhi NCR")
-    logger.info("Vehicles seeded", total=len(vehicles), mumbai=mum_c, delhi=del_c)
-    return vehicles
+    logger.info("Fleet seeded", vehicles=len(vehicles),
+                mumbai=sum(1 for v in vehicles if v["region"] == MUMBAI),
+                delhi=sum(1 for v in vehicles if v["region"] == DELHI))
+    return drivers, vehicles
 
 
-async def _seed_orders(db, vehicles):
-    await db.orders.delete_many({})
+def _history_created_at(now_utc: datetime) -> datetime:
+    """A creation time within the last 7 India days, weighted to business hours."""
+    now_ist = now_utc.replace(tzinfo=timezone.utc).astimezone(IST)
+    hours = list(range(7, 22))
+    weights = [2, 4, 7, 8, 7, 5, 5, 6, 7, 7, 6, 5, 3, 2, 1]
+    for _ in range(20):
+        day_offset = random.randint(0, 6)
+        hour = random.choices(hours, weights)[0]
+        created_ist = (now_ist - timedelta(days=day_offset)).replace(
+            hour=hour, minute=random.randint(0, 59), second=random.randint(0, 59), microsecond=0)
+        # must be old enough to have completed
+        if created_ist <= now_ist - timedelta(hours=3):
+            return created_ist.astimezone(timezone.utc).replace(tzinfo=None)
+    return now_utc - timedelta(days=random.randint(1, 6), hours=random.randint(0, 5))
+
+
+async def _seed_order_history(db, vehicles):
+    """~7 days of completed orders with realistic punctuality (~90% on time, ~3% failed)."""
     now = datetime.utcnow()
     orders = []
-    active_vehicles = [v for v in vehicles if v["status"] == "en_route"]
+    by_region = {MUMBAI: [v for v in vehicles if v["region"] == MUMBAI],
+                 DELHI: [v for v in vehicles if v["region"] == DELHI]}
 
-    def pick_zone_for(vehicle):
-        return DELHI_NCR_ZONES if vehicle.get("region") == "Delhi NCR" else MUMBAI_ZONES
-
-    # Historical (7 days)
-    for i in range(300):
-        hours_ago = random.uniform(0.5, 168)
+    for i in range(320):
         use_delhi = random.random() < 0.4
+        region = DELHI if use_delhi else MUMBAI
         zones = DELHI_NCR_ZONES if use_delhi else MUMBAI_ZONES
         pz, dz = random.choice(zones), random.choice(zones)
         plat, plng = rand_point(pz[1], pz[2])
         dlat, dlng = rand_point(dz[1], dz[2])
-        created = now - timedelta(hours=hours_ago)
-        delivered = created + timedelta(hours=random.uniform(0.4, 5))
-        dist = round(random.uniform(3, 32), 1)
+        weight = random_cargo_weight()
+        requires_ref = random.random() < 0.05
+
+        eligible = [v for v in by_region[region]
+                    if v["max_capacity_kg"] >= weight
+                    and (v["type"] == "refrigerated") == requires_ref]
+        if not eligible:
+            requires_ref = False
+            eligible = [v for v in by_region[region] if v["max_capacity_kg"] >= weight and v["type"] != "refrigerated"]
+        if not eligible:
+            continue
+        vehicle = random.choice(eligible)
+
+        created = _history_created_at(now)
+        pickup_leg = random.uniform(1.0, 6.0)
+        trip_km = max(1.5, haversine_km(plat, plng, dlat, dlng))
+        distance = pickup_leg + trip_km
+        speed = random.uniform(13, 24) if region == MUMBAI else random.uniform(18, 30)
+        predicted = distance / speed * 60 + 18          # + loading/unloading handling
+        actual = predicted * random.lognormvariate(0, 0.16)
+        if random.random() < 0.10:                      # incidental delay: traffic, waiting at gate...
+            actual += random.uniform(35, 110)
+        assigned_at = created + timedelta(minutes=random.uniform(1, 12))
+        delivered_at = assigned_at + timedelta(minutes=actual)
+        deadline = created + timedelta(minutes=max(120.0, predicted * random.uniform(1.4, 2.6)))
+        failed = random.random() < 0.03
         prefix = "DEL" if use_delhi else "MUM"
-        orders.append({
+        priority = random.choices(["low", "normal", "high", "critical"], weights=[12, 52, 28, 8])[0]
+
+        doc = {
             "order_id": f"ord-hist-{i:04d}",
-            "reference": f"{prefix}-{created.strftime('%y%m%d')}-{1000+i}",
-            "region": "Delhi NCR" if use_delhi else "Mumbai MMR",
-            "status": "delivered",
-            "priority": random.choices(["low","normal","high","critical"], weights=[12,52,28,8])[0],
+            "reference": f"{prefix}-{created.strftime('%y%m%d')}-{1000 + i}",
+            "region": region,
+            "status": "failed" if failed else "delivered",
+            "priority": priority,
             "customer_name": random.choice(INDIAN_COMPANIES),
             "pickup": make_address(pz[0], pz[3], plat, plng),
             "delivery": make_address(dz[0], dz[3], dlat, dlng),
-            "weight_kg": round(random.uniform(5, 1500), 1),
-            "assigned_vehicle_id": random.choice(vehicles)["vehicle_id"],
-            "deadline": (created + timedelta(hours=random.randint(2,8))).isoformat(),
-            "picked_up_at": (created + timedelta(minutes=random.randint(20,60))).isoformat(),
-            "delivered_at": delivered.isoformat(),
-            "estimated_distance_km": dist,
-            "actual_distance_km": round(dist * random.uniform(1.0, 1.12), 1),
-            "cost_inr": round(dist * random.uniform(18, 30), 0),
+            "weight_kg": weight,
+            "requires_refrigeration": requires_ref,
+            "fragile": False,
+            "description": "",
+            "assigned_vehicle_id": vehicle["vehicle_id"],
+            "assigned_at": assigned_at,
+            "deadline": deadline,
+            "estimated_distance_km": round(distance, 1),
+            "predicted_eta_minutes": round(predicted, 1),
             "sla_at_risk": False,
-            "created_at": created.isoformat(), "updated_at": delivered.isoformat(),
-        })
-
-    # Active
-    for i, v in enumerate(active_vehicles[:min(len(active_vehicles), 28)]):
-        zones = pick_zone_for(v)
-        pz, dz = random.choice(zones), random.choice(zones)
-        plat, plng = rand_point(pz[1], pz[2])
-        dlat, dlng = rand_point(dz[1], dz[2])
-        created = now - timedelta(minutes=random.randint(5, 120))
-        status = random.choice(["assigned","pickup_en_route","picked_up","delivery_en_route"])
-        eta = round(random.uniform(10, 95), 1)
-        dist = round(random.uniform(4, 28), 1)
-        prefix = "DEL" if v.get("region") == "Delhi NCR" else "MUM"
-        orders.append({
-            "order_id": f"ord-active-{i:03d}",
-            "reference": f"{prefix}-{now.strftime('%y%m%d')}-{2000+i}",
-            "region": v.get("region","Mumbai MMR"),
-            "status": status,
-            "priority": random.choices(["normal","high","critical"], weights=[50,38,12])[0],
-            "customer_name": random.choice(INDIAN_COMPANIES),
-            "pickup": make_address(pz[0], pz[3], plat, plng),
-            "delivery": make_address(dz[0], dz[3], dlat, dlng),
-            "weight_kg": round(random.uniform(10, 1000), 1),
-            "assigned_vehicle_id": v["vehicle_id"],
-            "assigned_at": created.isoformat(),
-            "deadline": (now + timedelta(hours=random.randint(1,5))).isoformat(),
-            "estimated_delivery_at": (now + timedelta(minutes=eta)).isoformat(),
-            "eta_minutes": eta,
-            "sla_at_risk": random.random() < 0.18,
-            "estimated_distance_km": dist,
-            "cost_inr": round(dist * random.uniform(18, 30), 0),
-            "created_at": created.isoformat(), "updated_at": now.isoformat(),
-        })
-
-    # Pending
-    for i in range(22):
-        use_delhi = random.random() < 0.4
-        zones = DELHI_NCR_ZONES if use_delhi else MUMBAI_ZONES
-        pz, dz = random.choice(zones), random.choice(zones)
-        plat, plng = rand_point(pz[1], pz[2])
-        dlat, dlng = rand_point(dz[1], dz[2])
-        dist = round(random.uniform(4, 30), 1)
-        prefix = "DEL" if use_delhi else "MUM"
-        orders.append({
-            "order_id": f"ord-pending-{i:03d}",
-            "reference": f"{prefix}-{now.strftime('%y%m%d')}-{3000+i}",
-            "region": "Delhi NCR" if use_delhi else "Mumbai MMR",
-            "status": "pending",
-            "priority": random.choices(["low","normal","high","critical"], weights=[12,45,35,8])[0],
-            "customer_name": random.choice(INDIAN_COMPANIES),
-            "pickup": make_address(pz[0], pz[3], plat, plng),
-            "delivery": make_address(dz[0], dz[3], dlat, dlng),
-            "weight_kg": round(random.uniform(5, 1200), 1),
-            "deadline": (now + timedelta(hours=random.randint(2,10))).isoformat(),
-            "estimated_distance_km": dist,
-            "cost_inr": round(dist * random.uniform(18, 30), 0),
-            "sla_at_risk": False,
-            "created_at": (now - timedelta(minutes=random.randint(1,45))).isoformat(),
-            "updated_at": now.isoformat(),
-        })
+            "reassignment_count": 0,
+            "cost_inr": round(distance * random.uniform(18, 30), 0),
+            "created_at": created,
+            "updated_at": delivered_at,
+        }
+        if not failed:
+            doc.update({
+                "picked_up_at": assigned_at + timedelta(minutes=actual * 0.35),
+                "delivered_at": delivered_at,
+                "actual_distance_km": round(distance * random.uniform(1.0, 1.1), 1),
+                "actual_duration_min": round(actual, 1),
+            })
+        orders.append(doc)
 
     await db.orders.insert_many(orders)
-    logger.info("Orders seeded", count=len(orders))
-    return orders
-
-
-async def _seed_incidents(db, vehicles, orders):
-    await db.incidents.delete_many({})
-    now = datetime.utcnow()
-    incidents = []
-    active_orders = [o for o in orders if o.get("status") in ("assigned","delivery_en_route","picked_up")]
-
-    MUM_ROADS = ["Western Express Highway","Eastern Freeway","NH-48","Sion-Panvel Highway","Thane-Belapur Road","JVLR"]
-    DEL_ROADS = ["NH-48 Gurgaon","Delhi-Noida Direct Flyway","Outer Ring Road","NH-9 Ghaziabad","Mehrauli-Badarpur Road","Ring Road"]
-    MUM_AREAS = ["Kurla Junction","Andheri flyover","Thane creek bridge","Vashi bridge","Ghatkopar flyover"]
-    DEL_AREAS = ["Karol Bagh chowk","DND Flyway entry","Dhaula Kuan","Saket Metro","Mehrauli crossing"]
-
-    templates = [
-        ("vehicle_breakdown","high","Breakdown: {v} on {road}",
-         "{v} ({plate}) engine failure near {area}. Temp: {temp}°C. Roadside assistance dispatched. Delivery reassigned.","action_taken"),
-        ("low_fuel","medium","Low CNG: {v}",
-         "{v} CNG level at 7.4%. Nearest IOCL CNG station at {area} assigned. ETA 3 min.","resolved"),
-        ("delivery_sla_risk","high","SLA Risk: {o} — {delta} min delay",
-         "Order {o} at risk due to congestion on {road}. Alternate route via {area} being evaluated.","monitoring"),
-        ("traffic_spike","medium","Congestion — {road}",
-         "Heavy jam on {road}. {count} vehicles affected. {rerouted} rerouted. Avg delay: {delta} min.","action_taken"),
-        ("route_deviation","low","Route Deviation: {v}",
-         "{v} deviated at {area}. Driver confirmed road closure due to civic works. Alternate accepted.","resolved"),
-        ("prolonged_stop","medium","Extended Stop: {v} — {delta} min",
-         "{v} stationary for {delta} min at {area}. Awaiting consignee signature.","monitoring"),
-        ("vehicle_breakdown","critical","Tyre Burst: {v} — {road}",
-         "{v} tyre burst on {road}. Vehicle secured. {count} deliveries reassigned.","action_taken"),
-        ("traffic_spike","high","Waterlogging: {area}",
-         "Waterlogging at {area}. 4 vehicles rerouted. Est delay 25-40 min.","action_taken"),
-    ]
-
-    for i, (itype, sev, title_t, desc_t, istatus) in enumerate(templates * 2):
-        v = random.choice(vehicles)
-        v2 = random.choice(vehicles)
-        o = random.choice(active_orders) if active_orders else {"reference":"N/A","order_id":"none"}
-        is_del = v.get("region","") == "Delhi NCR"
-        road = random.choice(DEL_ROADS if is_del else MUM_ROADS)
-        area = random.choice(DEL_AREAS if is_del else MUM_AREAS)
-        delta = str(random.randint(8, 40))
-        count = str(random.randint(3, 9))
-        rerouted = str(random.randint(2, 5))
-        plate = v.get("registration","MH-12-AB-1234")
-        temp = str(random.randint(145, 168))
-        created = now - timedelta(hours=random.uniform(0.1, 20))
-
-        fmt = lambda t: (t.replace("{v}", v["name"]).replace("{v2}", v2["name"])
-                          .replace("{o}", o.get("reference","")).replace("{road}", road)
-                          .replace("{area}", area).replace("{delta}", delta)
-                          .replace("{count}", count).replace("{rerouted}", rerouted)
-                          .replace("{plate}", plate).replace("{temp}", temp))
-
-        timeline = [
-            {"timestamp": created.isoformat(), "event": "Incident detected by telemetry", "actor": "system"},
-            {"timestamp": (created + timedelta(minutes=1, seconds=30)).isoformat(), "event": "Operations team alerted", "actor": "system"},
-            {"timestamp": (created + timedelta(minutes=3)).isoformat(), "event": "Severity assessed", "actor": "system"},
-        ]
-        if istatus in ("action_taken","monitoring","resolved"):
-            timeline.append({"timestamp": (created + timedelta(minutes=4)).isoformat(),
-                             "event": "Autonomous action by optimization engine", "actor": "system"})
-        if istatus == "resolved":
-            timeline.append({"timestamp": (created + timedelta(minutes=random.randint(20,90))).isoformat(),
-                             "event": "Incident resolved — normal operations resumed", "actor": "system"})
-
-        incidents.append({
-            "incident_id": f"INC-{uuid.uuid4().hex[:8].upper()}",
-            "type": itype, "severity": sev, "status": istatus,
-            "title": fmt(title_t), "description": fmt(desc_t),
-            "vehicle_id": v["vehicle_id"], "vehicle_name": v["name"],
-            "vehicle_registration": plate,
-            "region": v.get("region","Mumbai MMR"),
-            "order_ids": [o.get("order_id","")],
-            "autonomous_actions": [{
-                "action_type": "reroute_vehicle",
-                "description": f"{v['name']} rerouted via alternate corridor",
-                "vehicle_id": v["vehicle_id"],
-                "reason": "Primary route congestion exceeded 1.8× threshold",
-                "expected_impact": f"ETA reduction of {random.randint(8,22)} minutes",
-                "executed_at": (created + timedelta(minutes=4)).isoformat(),
-                "outcome": f"ETA reduced by {random.randint(6,20)} minutes" if istatus == "resolved" else None,
-            }] if itype in ("traffic_spike","route_deviation","vehicle_breakdown") else [],
-            "timeline": timeline,
-            "created_at": created.isoformat(),
-            "updated_at": (created + timedelta(minutes=random.randint(5,60))).isoformat(),
-            "resolved_at": (created + timedelta(hours=random.uniform(0.3,2.5))).isoformat() if istatus == "resolved" else None,
-        })
-
-    await db.incidents.insert_many(incidents)
-    logger.info("Incidents seeded", count=len(incidents))
-
-
-async def _seed_optimization_runs(db):
-    await db.optimization_runs.delete_many({})
-    now = datetime.utcnow()
-    runs = []
-    for i in range(30):
-        created = now - timedelta(hours=random.uniform(0.1, 96))
-        before = random.uniform(280, 650)
-        pct = random.uniform(0.04, 0.19)
-        after = before * (1 - pct)
-        speed = random.choice([26, 30, 34])
-        before_dur = (before / speed) * 60
-        after_dur = before_dur * (1 - pct * 0.8)
-        region = random.choice(["Mumbai MMR", "Delhi NCR", "Both Regions"])
-        runs.append({
-            "run_id": f"OPT-{uuid.uuid4().hex[:8].upper()}",
-            "trigger": random.choice(["scheduled","new_order","vehicle_breakdown","traffic_change","manual"]),
-            "region": region,
-            "status": "completed",
-            "vehicles_considered": random.randint(8, 40),
-            "orders_in_scope": random.randint(3, 22),
-            "before_total_distance_km": round(before, 1),
-            "after_total_distance_km": round(after, 1),
-            "before_total_duration_min": round(before_dur, 1),
-            "after_total_duration_min": round(after_dur, 1),
-            "distance_saved_km": round(before - after, 1),
-            "time_saved_min": round(before_dur - after_dur, 1),
-            "improvement_pct": round(pct * 100, 1),
-            "cost_saved_inr": round((before - after) * random.uniform(18, 28), 0),
-            "assignments_changed": random.randint(1, 8),
-            "routes_updated": random.randint(1, 12),
-            "summary": f"Fleet distance reduced by {round(pct*100,1)}% across {region}. {random.randint(1,8)} reassignment(s) applied.",
-            "solver_duration_ms": round(random.uniform(85, 580), 1),
-            "created_at": created.isoformat(),
-            "completed_at": (created + timedelta(milliseconds=random.randint(100,600))).isoformat(),
-        })
-    await db.optimization_runs.insert_many(runs)
-    logger.info("Optimization runs seeded", count=len(runs))
+    logger.info("Order history seeded", count=len(orders))

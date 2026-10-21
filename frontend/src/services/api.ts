@@ -1,10 +1,19 @@
 /**
- * Centralized API client with authentication, error handling and typed responses.
+ * Typed API client. One function per backend endpoint the UI uses.
+ * 401 on an authenticated request clears the session; errors surface as ApiError.
  */
+import type {
+  AnalyticsOverview, CreateOrderPayload, CreateOrderResponse, DemandForecast, EtaPerformancePoint,
+  EtaPrediction, FleetStats, HourlyDeliveries, Incident, IncidentList, IncidentStats, MLStatus,
+  OptimizationRun, OptimizationStats, Order, OrderStats, Paginated, Region, SimulationStatus,
+  Vehicle, VehicleDetail,
+} from '../types'
 
 const BASE_URL = import.meta.env.VITE_API_BASE_URL || '/api/v1'
+const TOKEN_KEY = 'fleetops_token'
+const USER_KEY = 'fleetops_user'
 
-class ApiError extends Error {
+export class ApiError extends Error {
   status: number
   detail: string
   constructor(status: number, detail: string) {
@@ -15,129 +24,127 @@ class ApiError extends Error {
   }
 }
 
-function getToken(): string | null {
-  return localStorage.getItem('fleetops_token')
+function describeDetail(detail: unknown, fallback: string): string {
+  if (typeof detail === 'string') return detail
+  // FastAPI validation errors: [{loc: [...], msg: '...'}, ...]
+  if (Array.isArray(detail)) {
+    return detail.map((d: { loc?: unknown[]; msg?: string }) =>
+      `${(d.loc ?? []).filter(p => p !== 'body').join('.')}: ${d.msg ?? 'invalid'}`).join('; ')
+  }
+  return fallback
 }
 
-async function request<T>(
-  path: string,
-  options: RequestInit = {},
-): Promise<T> {
-  const token = getToken()
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-    ...(options.headers as Record<string, string>),
-  }
+async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const token = localStorage.getItem(TOKEN_KEY)
+  const headers: Record<string, string> = { ...(options.headers as Record<string, string>) }
+  if (options.body) headers['Content-Type'] = 'application/json'
   if (token) headers['Authorization'] = `Bearer ${token}`
 
-  const res = await fetch(`${BASE_URL}${path}`, { ...options, headers })
+  let res: Response
+  try {
+    res = await fetch(`${BASE_URL}${path}`, { ...options, headers })
+  } catch {
+    throw new ApiError(0, 'Cannot reach the FleetOps API. Is the backend running?')
+  }
 
-  if (res.status === 401) {
-    localStorage.removeItem('fleetops_token')
-    localStorage.removeItem('fleetops_user')
-    window.location.href = '/login'
+  if (res.status === 401 && token) {
+    // Session expired / revoked - drop it and send the user to sign in again
+    localStorage.removeItem(TOKEN_KEY)
+    localStorage.removeItem(USER_KEY)
+    window.location.assign('/login')
     throw new ApiError(401, 'Session expired')
   }
 
   if (!res.ok) {
-    let detail = `HTTP ${res.status}`
+    let detail = `Request failed (HTTP ${res.status})`
     try {
       const body = await res.json()
-      detail = body.detail || detail
-    } catch {}
+      detail = describeDetail(body.detail, detail)
+    } catch { /* non-JSON error body */ }
     throw new ApiError(res.status, detail)
   }
 
   return res.json() as Promise<T>
 }
 
-const get  = <T>(path: string)         => request<T>(path)
-const post = <T>(path: string, data?: unknown) => request<T>(path, { method: 'POST', body: JSON.stringify(data) })
+const qs = (params?: Record<string, string | number | boolean | undefined | null>) => {
+  const entries = Object.entries(params ?? {}).filter(([, v]) => v !== undefined && v !== null && v !== '' && v !== 'all')
+  return entries.length ? '?' + new URLSearchParams(entries.map(([k, v]) => [k, String(v)])).toString() : ''
+}
+
+const get = <T>(path: string) => request<T>(path)
+const post = <T>(path: string, data?: unknown) =>
+  request<T>(path, { method: 'POST', body: data === undefined ? undefined : JSON.stringify(data) })
 
 // ── Auth ───────────────────────────────────────────────────────────────────────
 export const authApi = {
   login: (username: string, password: string) =>
     post<{ access_token: string; user_id: string; username: string; role: string; full_name: string }>(
-      '/auth/login', { username, password }
-    ),
+      '/auth/login', { username, password }),
   me: () => get<{ user_id: string; username: string; email: string; full_name: string; role: string }>('/auth/me'),
-  logout: () => post('/auth/logout'),
 }
 
 // ── Vehicles ───────────────────────────────────────────────────────────────────
 export const vehiclesApi = {
-  list: (params?: { status?: string; type?: string; page?: number; page_size?: number }) => {
-    const q = new URLSearchParams(
-      Object.fromEntries(Object.entries(params || {}).filter(([,v]) => v != null).map(([k,v]) => [k, String(v)]))
-    ).toString()
-    return get<{ items: unknown[]; total: number; page: number; pages: number }>(`/vehicles${q ? '?' + q : ''}`)
-  },
-  get: (id: string) => get<unknown>(`/vehicles/${id}`),
-  stats: () => get<unknown>('/vehicles/stats'),
+  list: (p?: { status?: string; type?: string; region?: string; search?: string; page?: number; page_size?: number }) =>
+    get<Paginated<Vehicle>>(`/vehicles${qs(p)}`),
+  get: (id: string) => get<VehicleDetail>(`/vehicles/${id}`),
+  stats: () => get<FleetStats>('/vehicles/stats'),
 }
 
 // ── Orders ─────────────────────────────────────────────────────────────────────
 export const ordersApi = {
-  list: (params?: { status?: string; priority?: string; page?: number; page_size?: number }) => {
-    const q = new URLSearchParams(
-      Object.fromEntries(Object.entries(params || {}).filter(([,v]) => v != null).map(([k,v]) => [k, String(v)]))
-    ).toString()
-    return get<{ items: unknown[]; total: number; page: number; pages: number }>(`/orders${q ? '?' + q : ''}`)
-  },
-  get: (id: string) => get<unknown>(`/orders/${id}`),
-  stats: () => get<unknown>('/orders/stats'),
-  create: (data: unknown) => post<unknown>('/orders', data),
+  list: (p?: { status?: string; priority?: string; region?: string; search?: string; page?: number; page_size?: number }) =>
+    get<Paginated<Order>>(`/orders${qs(p)}`),
+  get: (id: string) => get<Order>(`/orders/${id}`),
+  stats: () => get<OrderStats>('/orders/stats'),
+  create: (data: CreateOrderPayload) => post<CreateOrderResponse>('/orders', data),
 }
 
 // ── Incidents ──────────────────────────────────────────────────────────────────
 export const incidentsApi = {
-  list: (params?: { status?: string; severity?: string; page?: number }) => {
-    const q = new URLSearchParams(
-      Object.fromEntries(Object.entries(params || {}).filter(([,v]) => v != null).map(([k,v]) => [k, String(v)]))
-    ).toString()
-    return get<{ items: unknown[]; total: number; active_count: number }>(`/incidents${q ? '?' + q : ''}`)
-  },
-  get: (id: string) => get<unknown>(`/incidents/${id}`),
-  stats: () => get<unknown>('/incidents/stats'),
-  resolve: (id: string) => post(`/incidents/${id}/resolve`),
+  /** status may be 'active' (anything unresolved) or a concrete status */
+  list: (p?: { status?: string; severity?: string; type?: string; page?: number; page_size?: number }) =>
+    get<IncidentList>(`/incidents${qs(p)}`),
+  get: (id: string) => get<Incident>(`/incidents/${id}`),
+  stats: () => get<IncidentStats>('/incidents/stats'),
+  resolve: (id: string, notes?: string) => post<Incident>(`/incidents/${id}/resolve`, notes ? { notes } : undefined),
 }
 
 // ── Optimization ───────────────────────────────────────────────────────────────
 export const optimizationApi = {
-  run: () => post<unknown>('/optimization/run'),
-  listRuns: (page = 1) => get<{ items: unknown[]; total: number }>(`/optimization/runs?page=${page}&page_size=20`),
-  getRun: (id: string) => get<unknown>(`/optimization/runs/${id}`),
-  stats: () => get<unknown>('/optimization/stats'),
+  run: () => post<OptimizationRun>('/optimization/run'),
+  listRuns: (p?: { page?: number; page_size?: number; trigger?: string }) =>
+    get<Paginated<OptimizationRun>>(`/optimization/runs${qs({ page_size: 20, ...p })}`),
+  getRun: (id: string) => get<OptimizationRun>(`/optimization/runs/${id}`),
+  stats: () => get<OptimizationStats>('/optimization/stats'),
 }
 
 // ── Analytics ──────────────────────────────────────────────────────────────────
 export const analyticsApi = {
-  overview: () => get<unknown>('/analytics/overview'),
-  deliveriesPerHour: () => get<unknown[]>('/analytics/deliveries-per-hour'),
-  etaPerformance: () => get<unknown[]>('/analytics/eta-performance'),
+  overview: () => get<AnalyticsOverview>('/analytics/overview'),
+  deliveriesPerHour: () => get<HourlyDeliveries[]>('/analytics/deliveries-per-hour'),
+  etaPerformance: (limit = 50) => get<EtaPerformancePoint[]>(`/analytics/eta-performance?limit=${limit}`),
 }
 
 // ── ML ─────────────────────────────────────────────────────────────────────────
 export const mlApi = {
-  status: () => get<unknown>('/predictions/status'),
-  predictEta: (params: { distance_km: number; speed_kmh?: number; n_stops?: number; traffic_factor?: number }) => {
-    const q = new URLSearchParams(Object.fromEntries(Object.entries(params).map(([k,v]) => [k, String(v)]))).toString()
-    return post<unknown>(`/predictions/eta?${q}`)
-  },
-  demand: () => get<unknown>('/predictions/demand'),
+  status: () => get<MLStatus>('/predictions/status'),
+  /** speed_kmh is the vehicle's FREE-FLOW speed; congestion goes in traffic_factor. */
+  predictEta: (p: { distance_km: number; speed_kmh: number; n_stops: number; traffic_factor: number }) =>
+    post<EtaPrediction>(`/predictions/eta${qs(p)}`),
+  demand: () => get<DemandForecast>('/predictions/demand'),
 }
 
 // ── Simulation ─────────────────────────────────────────────────────────────────
 export const simApi = {
-  status: () => get<unknown>('/simulation/status'),
-  start: () => post('/simulation/start'),
-  pause: () => post('/simulation/pause'),
-  resume: () => post('/simulation/resume'),
-  setSpeed: (speed: number) => post('/simulation/speed', { speed }),
-  triggerTraffic: () => post('/simulation/trigger/traffic'),
-  triggerBreakdown: (vehicle_id?: string) => {
-    const q = vehicle_id ? `?vehicle_id=${vehicle_id}` : ''
-    return post(`/simulation/trigger/breakdown${q}`)
-  },
-  triggerOrder: () => post('/simulation/trigger/order'),
+  status: () => get<SimulationStatus>('/simulation/status'),
+  pause: () => post<{ paused: boolean }>('/simulation/pause'),
+  resume: () => post<{ paused: boolean }>('/simulation/resume'),
+  setSpeed: (speed: number) => post<{ speed: number }>('/simulation/speed', { speed }),
+  triggerTraffic: (region?: Region) =>
+    post<{ message: string; region: Region; affected: number }>(`/simulation/trigger/traffic${qs({ region })}`),
+  triggerBreakdown: (vehicle_id?: string) =>
+    post<{ message: string; vehicle_id: string }>(`/simulation/trigger/breakdown${qs({ vehicle_id })}`),
+  triggerOrder: () => post<{ message: string; order_id: string | null }>('/simulation/trigger/order'),
 }

@@ -50,6 +50,7 @@ class VehicleHealth(BaseModel):
 class Vehicle(BaseModel):
     vehicle_id: str
     name: str  # e.g. "V-101"
+    registration: Optional[str] = None  # number plate
     type: VehicleType
     fuel_type: FuelType
     status: VehicleStatus = VehicleStatus.AVAILABLE
@@ -67,6 +68,9 @@ class Vehicle(BaseModel):
     # Energy
     fuel_level: float = 100.0  # percent (also used for battery)
     fuel_range_km: float = 0.0  # estimated range
+
+    # Operating region ("Mumbai MMR" | "Delhi NCR")
+    region: Optional[str] = None
 
     # Current assignment
     current_order_id: Optional[str] = None

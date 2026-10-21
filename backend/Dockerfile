@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps for numpy/scipy/ortools
+# System deps for numpy/scipy/xgboost builds
 # Retry apt-get to handle transient DNS/network failures in Docker
 RUN for i in 1 2 3; do \
       apt-get update && apt-get install -y --no-install-recommends --fix-missing \

@@ -1,31 +1,30 @@
 import { create } from 'zustand'
 import type { AuthUser, AuthState } from '../types'
 import { authApi } from '../services/api'
+import { queryClient } from '../lib/queryClient'
 
 interface AuthStore extends AuthState {
   login: (username: string, password: string) => Promise<void>
   logout: () => void
-  loadFromStorage: () => void
+}
+
+/** Read the persisted session synchronously so a page refresh never flashes the login screen. */
+function readSession(): AuthState {
+  const token = localStorage.getItem('fleetops_token')
+  const raw = localStorage.getItem('fleetops_user')
+  if (token && raw) {
+    try {
+      return { token, user: JSON.parse(raw) as AuthUser, isAuthenticated: true }
+    } catch {
+      localStorage.removeItem('fleetops_token')
+      localStorage.removeItem('fleetops_user')
+    }
+  }
+  return { token: null, user: null, isAuthenticated: false }
 }
 
 export const useAuthStore = create<AuthStore>((set) => ({
-  token: null,
-  user: null,
-  isAuthenticated: false,
-
-  loadFromStorage() {
-    const token = localStorage.getItem('fleetops_token')
-    const userStr = localStorage.getItem('fleetops_user')
-    if (token && userStr) {
-      try {
-        const user = JSON.parse(userStr) as AuthUser
-        set({ token, user, isAuthenticated: true })
-      } catch {
-        localStorage.removeItem('fleetops_token')
-        localStorage.removeItem('fleetops_user')
-      }
-    }
-  },
+  ...readSession(),
 
   async login(username, password) {
     const res = await authApi.login(username, password)
@@ -44,7 +43,7 @@ export const useAuthStore = create<AuthStore>((set) => ({
   logout() {
     localStorage.removeItem('fleetops_token')
     localStorage.removeItem('fleetops_user')
+    queryClient.clear()
     set({ token: null, user: null, isAuthenticated: false })
-    window.location.href = '/login'
   },
 }))

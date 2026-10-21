@@ -1,26 +1,44 @@
 """
-Vehicle Simulation Engine — India Fleet
-Mumbai MMR + Delhi NCR dual-region operation.
+Vehicle Simulation Engine - India fleet (Mumbai MMR + Delhi NCR).
 
-Real Indian vehicle models, authentic traffic patterns:
-- Mumbai: 18-32 km/h avg, severe peak-hour congestion (8-11am, 6-9pm)
-- Delhi: 22-38 km/h avg, pollution-related restrictions
-- Monsoon season traffic multipliers
-- CNG/Electric/Diesel fuel types with realistic consumption
+The engine moves vehicles, advances orders through their lifecycle, injects
+traffic / breakdown / low-fuel events, and persists every state change.
+
+What it deliberately does NOT do: decide which vehicle serves which order.
+Dispatch is owned by the optimization engine (see app/optimization/engine.py);
+the simulation only exposes `assign_order()` and calls the registered
+dispatcher whenever work is waiting.
+
+Time model
+----------
+Every tick advances the simulated world by `interval` seconds. The wall-clock
+delay between ticks is `interval / speed`, so a 10x speed-up simply ticks 10x
+more often. All durations (handling time, repairs, surge length, order
+elapsed time) are measured in simulated seconds.
 """
 import asyncio
 import math
 import random
 import uuid
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Awaitable, Callable, Dict, List, Optional
+
 import structlog
+from pymongo import UpdateOne
 
 from app.config import settings
-from app.models.vehicle import Vehicle, VehicleStatus, GeoPoint, VehicleHealth
-from app.models.order import Order, OrderStatus, OrderPriority, AddressPoint
-from app.models.incident import Incident, IncidentType, IncidentSeverity, IncidentStatus
-from app.websocket.broadcaster import broadcaster, WSEventType
+from app.models.incident import (
+    AutonomousAction, Incident, IncidentSeverity, IncidentStatus,
+    IncidentTimelineEntry, IncidentType,
+)
+from app.models.optimization import OptimizationTrigger
+from app.models.order import AddressPoint, Order, OrderPriority, OrderStatus
+from app.models.vehicle import GeoPoint, Vehicle, VehicleStatus
+from app.utils.cargo import random_cargo_weight
+from app.utils.geo import (  # re-exported for callers/tests
+    DELHI, MUMBAI, REGIONS, bearing, haversine_km, ist_hour, region_for_lng,
+)
+from app.websocket.broadcaster import WSEventType, broadcaster
 
 logger = structlog.get_logger(__name__)
 
@@ -47,69 +65,71 @@ MUMBAI_ZONES = [
 ]
 
 DELHI_NCR_ZONES = [
-    ("Connaught Place",  28.6315, 77.2167, "DL"),
-    ("Karol Bagh",       28.6508, 77.1900, "DL"),
-    ("Lajpat Nagar",     28.5665, 77.2433, "DL"),
-    ("Saket",            28.5245, 77.2066, "DL"),
-    ("Dwarka",           28.5921, 77.0460, "DL"),
-    ("Rohini",           28.7041, 77.1025, "DL"),
-    ("Noida Sector 18",  28.5705, 77.3219, "UP"),
-    ("Noida Sector 62",  28.6270, 77.3650, "UP"),
-    ("Greater Noida",    28.4744, 77.5040, "UP"),
-    ("Gurgaon Sector 29",28.4595, 77.0266, "HR"),
-    ("Gurgaon DLF",      28.4672, 77.0435, "HR"),
-    ("Faridabad",        28.4089, 77.3178, "HR"),
-    ("Ghaziabad",        28.6692, 77.4538, "UP"),
-    ("Vasant Kunj",      28.5244, 77.1571, "DL"),
-    ("Nehru Place",      28.5491, 77.2519, "DL"),
-    ("Gurugram Cyber Hub",28.4949,77.0887, "HR"),
+    ("Connaught Place",   28.6315, 77.2167, "DL"),
+    ("Karol Bagh",        28.6508, 77.1900, "DL"),
+    ("Lajpat Nagar",      28.5665, 77.2433, "DL"),
+    ("Saket",             28.5245, 77.2066, "DL"),
+    ("Dwarka",            28.5921, 77.0460, "DL"),
+    ("Rohini",            28.7041, 77.1025, "DL"),
+    ("Noida Sector 18",   28.5705, 77.3219, "UP"),
+    ("Noida Sector 62",   28.6270, 77.3650, "UP"),
+    ("Greater Noida",     28.4744, 77.5040, "UP"),
+    ("Gurgaon Sector 29", 28.4595, 77.0266, "HR"),
+    ("Gurgaon DLF",       28.4672, 77.0435, "HR"),
+    ("Faridabad",         28.4089, 77.3178, "HR"),
+    ("Ghaziabad",         28.6692, 77.4538, "UP"),
+    ("Vasant Kunj",       28.5244, 77.1571, "DL"),
+    ("Nehru Place",       28.5491, 77.2519, "DL"),
+    ("Gurugram Cyber Hub", 28.4949, 77.0887, "HR"),
 ]
 
 ALL_ZONES = MUMBAI_ZONES + DELHI_NCR_ZONES
+ZONES_BY_REGION = {MUMBAI: MUMBAI_ZONES, DELHI: DELHI_NCR_ZONES}
 
 INDIAN_COMPANIES = [
-    "Reliance Retail Ltd","Tata Consumer Products","Flipkart Logistics",
-    "Amazon India Pvt Ltd","BigBasket Fulfilment","Zomato Hyperpure",
-    "Meesho Warehouse","Nykaa Distribution","Mahindra Logistics",
-    "Blue Dart Express","DTDC Courier","Delhivery Ltd",
-    "Ekart Logistics","Shadowfax Technologies","Porter Logistics",
-    "Dunzo Daily","Swiggy Instamart","Blinkit Dark Store",
-    "Spencer's Retail","DMart Distribution","Jio Commerce",
-    "Godrej Consumer","Hindustan Unilever","ITC Limited",
-    "Haldiram's Distribution","Amul Dairy","Mother Dairy",
-    "Zepto Dark Store","PharmEasy Express","Pepperfry Logistics",
+    "Reliance Retail Ltd", "Tata Consumer Products", "Flipkart Logistics",
+    "Amazon India Pvt Ltd", "BigBasket Fulfilment", "Zomato Hyperpure",
+    "Meesho Warehouse", "Nykaa Distribution", "Mahindra Logistics",
+    "Blue Dart Express", "DTDC Courier", "Delhivery Ltd",
+    "Ekart Logistics", "Shadowfax Technologies", "Porter Logistics",
+    "Dunzo Daily", "Swiggy Instamart", "Blinkit Dark Store",
+    "Spencer's Retail", "DMart Distribution", "Jio Commerce",
+    "Godrej Consumer", "Hindustan Unilever", "ITC Limited",
+    "Haldiram's Distribution", "Amul Dairy", "Mother Dairy",
+    "Zepto Dark Store", "PharmEasy Express", "Pepperfry Logistics",
 ]
 
-VEHICLE_MODELS = {
-    "van":          ["Tata Ace Gold","Tata Ace HT","Mahindra Bolero Pikup","Mahindra Jeeto","Ashok Leyland Dost","Force Traveller T1","Mahindra Supro"],
-    "truck":        ["Tata LPT 1412","Tata LPT 1616","Tata Prima 2528","Eicher Pro 2095","Eicher Pro 3015","BharatBenz 1617","Ashok Leyland U-Truck 1616"],
-    "cargo_bike":   ["Euler HiLoad EV","OSM Rage+","Mahindra Treo Zor","Piaggio Ape E-City"],
-    "motorcycle":   ["Hero Splendor+","Honda Activa 6G","TVS Apache RTR","Bajaj Platina 110"],
-    "refrigerated": ["Tata Ace Zip Reefer","Mahindra Jeeto Reefer","Eicher Pro 2095 Reefer"],
+# ── Tunables (simulated seconds unless noted) ─────────────────────────────────
+PICKUP_HANDLING_SEC = 240
+DELIVERY_HANDLING_SEC = 180
+REFUEL_SEC = 180
+LOW_FUEL_PCT = 15.0           # idle vehicles below this go to refuel
+CRITICAL_FUEL_PCT = 8.0       # en-route vehicles below this raise an incident
+BREAKDOWN_RATE_PER_TICK = 0.00004
+SURGE_DURATION_SEC = 1200
+ORDER_GEN_EVERY_TICKS = 10
+ORDER_GEN_PROBABILITY = 0.25   # ~0.75 new orders/min at 1x: keeps a 78-vehicle fleet around half busy
+DISPATCH_EVERY_TICKS = 3
+PERSIST_VEHICLES_EVERY_TICKS = 15
+
+# Typical free-flow city speed (km/h) by region and by vehicle type.
+BASE_SPEED_KMH = {MUMBAI: 24.0, DELHI: 30.0}
+TYPE_SPEED_FACTOR = {
+    "van": 1.0, "truck": 0.85, "cargo_bike": 1.15, "motorcycle": 1.3, "refrigerated": 0.95,
 }
 
-ROADS_MUM = ["Western Express Highway","Eastern Freeway","NH-48","Sion-Panvel Highway","JVLR","Thane-Belapur Road"]
-ROADS_DEL = ["NH-48 Gurgaon","Delhi-Noida Direct Flyway","Outer Ring Road","NH-9","Mehrauli-Badarpur Road"]
-AREAS_MUM = ["Kurla Junction","Andheri flyover","Thane creek bridge","Vashi bridge","Ghatkopar flyover"]
-AREAS_DEL = ["Karol Bagh chowk","DND Flyway","Dhaula Kuan","Saket Metro","NH-48 toll plaza"]
+# Energy use in % of tank/battery per km.
+def fuel_use_pct_per_km(fuel_type: str, vehicle_type: str) -> float:
+    if fuel_type == "electric":
+        return 0.8
+    if fuel_type == "cng":
+        return 0.35
+    if fuel_type == "petrol":
+        return 0.2
+    return 0.12 if vehicle_type == "truck" else 0.2     # diesel
 
 
-def haversine_km(lat1, lng1, lat2, lng2):
-    R = 6371.0
-    dlat = math.radians(lat2 - lat1)
-    dlng = math.radians(lng2 - lng1)
-    a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlng/2)**2
-    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
-
-
-def bearing(lat1, lng1, lat2, lng2):
-    dlng = math.radians(lng2 - lng1)
-    lat1r, lat2r = math.radians(lat1), math.radians(lat2)
-    x = math.sin(dlng) * math.cos(lat2r)
-    y = math.cos(lat1r) * math.sin(lat2r) - math.sin(lat1r) * math.cos(lat2r) * math.cos(dlng)
-    return (math.degrees(math.atan2(x, y)) + 360) % 360
-
-
+# ── Geometry helpers ──────────────────────────────────────────────────────────
 def move_toward(lat, lng, tlat, tlng, speed_kmh, dt_hours):
     dist = haversine_km(lat, lng, tlat, tlng)
     travel = speed_kmh * dt_hours
@@ -128,36 +148,59 @@ def random_point(zone, radius_km=1.8):
     return z_lat + dlat, z_lng + dlng
 
 
-def make_indian_address(zone):
+def nearest_zone_name(lat: float, lng: float) -> str:
+    return min(ALL_ZONES, key=lambda z: haversine_km(lat, lng, z[1], z[2]))[0]
+
+
+def make_indian_address(zone) -> str:
     z_name, _, _, z_state = zone
-    state_name = {"DL":"Delhi","UP":"Uttar Pradesh","HR":"Haryana","MH":"Maharashtra"}.get(z_state,"India")
-    areas = ["Shivaji Nagar","Gandhi Nagar","Nehru Nagar","Rajendra Nagar","Laxmi Nagar"]
-    road = random.choice(["Marg","Road","Lane","Colony","Sector","Nagar"])
-    pin = random.randint(110001,110099) if z_state=="DL" else random.randint(201301,201310) if z_state=="UP" else random.randint(400001,421605)
-    return f"{random.randint(1,500)}, {random.choice(areas)} {road}, {z_name}, {state_name} - {pin}"
+    state_name = {"DL": "Delhi", "UP": "Uttar Pradesh", "HR": "Haryana", "MH": "Maharashtra"}.get(z_state, "India")
+    areas = ["Shivaji Nagar", "Gandhi Nagar", "Nehru Nagar", "Rajendra Nagar", "Laxmi Nagar"]
+    road = random.choice(["Marg", "Road", "Lane", "Colony", "Sector", "Nagar"])
+    if z_state == "DL":
+        pin = random.randint(110001, 110099)
+    elif z_state == "UP":
+        pin = random.randint(201301, 201310)
+    elif z_state == "HR":
+        pin = random.randint(122001, 122018)
+    else:
+        pin = random.randint(400001, 421605)
+    return f"{random.randint(1, 500)}, {random.choice(areas)} {road}, {z_name}, {state_name} - {pin}"
 
 
+# ── Per-vehicle state ─────────────────────────────────────────────────────────
 class VehicleSimState:
     def __init__(self, vehicle: Vehicle):
         self.vehicle = vehicle
+        self.region: str = vehicle.region or region_for_lng(vehicle.location.coordinates[0])
+        vehicle.region = self.region
         self.target_lat: Optional[float] = None
         self.target_lng: Optional[float] = None
-        self.phase: str = "idle"
+        self.phase: str = "idle"   # idle|to_pickup|at_pickup|to_delivery|at_delivery|refuelling
         self.current_order: Optional[Order] = None
         self.stop_timer: float = 0.0
         self.telemetry_counter: int = 0
-        self.traffic_factor: float = 1.0
-        # Determine region from location (approximate)
-        lng = vehicle.location.coordinates[0]
-        self.is_delhi = lng > 76.5  # Mumbai ~72.8, Delhi ~77.2
+        self.speed_noise: float = 1.0
+        # Per-order accounting (simulated)
+        self.order_elapsed_min: float = 0.0
+        self.order_distance_km: float = 0.0
+        # Repairs / refuelling
+        self.repair_remaining_sec: float = 0.0
+        self.refuel_remaining_sec: float = 0.0
+        self.breakdown_incident: Optional[Incident] = None
+        self.low_fuel_incident: Optional[Incident] = None
 
     @property
-    def lat(self):
+    def lat(self) -> float:
         return self.vehicle.location.coordinates[1]
 
     @property
-    def lng(self):
+    def lng(self) -> float:
         return self.vehicle.location.coordinates[0]
+
+    @property
+    def is_delhi(self) -> bool:
+        return self.region == DELHI
 
     def set_position(self, lat, lng):
         self.vehicle.location = GeoPoint(coordinates=[lng, lat])
@@ -166,14 +209,9 @@ class VehicleSimState:
         self.target_lat = lat
         self.target_lng = lng
 
-    def typical_speed(self):
-        """City-appropriate speed range in km/h."""
-        if self.is_delhi:
-            # Delhi slightly faster, wide roads
-            return random.uniform(22, 38) / max(self.traffic_factor, 0.5)
-        else:
-            # Mumbai: dense, slower
-            return random.uniform(16, 30) / max(self.traffic_factor, 0.5)
+
+IncidentCallback = Callable[[Incident, bool], Awaitable[None]]
+Dispatcher = Callable[..., Awaitable[object]]
 
 
 class SimulationEngine:
@@ -185,26 +223,48 @@ class SimulationEngine:
         self.tick_count = 0
         self.persist_interval = settings.TELEMETRY_PERSIST_INTERVAL
         self._vehicles: Dict[str, VehicleSimState] = {}
-        self._orders: Dict[str, Order] = {}
-        self._pending_orders: List[Order] = []
+        self._orders: Dict[str, Order] = {}          # live orders only (not yet delivered)
+        self._incidents: Dict[str, Incident] = {}
         self._db = None
-        self._order_gen_counter = 0
         self._task: Optional[asyncio.Task] = None
-        self._on_incident_callbacks = []
-        self._on_order_callbacks = []
+        self._order_gen_counter = 0
+        self._on_incident_callbacks: List[IncidentCallback] = []
+        self._on_order_callbacks: List[Callable[[Order], Awaitable[None]]] = []
+        self._dispatcher: Optional[Dispatcher] = None
+        self._traffic: Dict[str, float] = {r: 1.0 for r in REGIONS}       # effective (incl. surge)
+        self._traffic_base: Dict[str, float] = {r: 1.0 for r in REGIONS}  # time-of-day baseline
+        self._surges: Dict[str, dict] = {}
+        self._sla_alerted: set = set()
 
-    def register_incident_callback(self, cb):
+    # ── Wiring ────────────────────────────────────────────────────────────────
+    def register_incident_callback(self, cb: IncidentCallback):
         self._on_incident_callbacks.append(cb)
 
     def register_order_callback(self, cb):
         self._on_order_callbacks.append(cb)
 
+    def register_dispatcher(self, dispatcher: Dispatcher):
+        self._dispatcher = dispatcher
+
     def set_db(self, db):
         self._db = db
 
+    # ── Loading / queries ─────────────────────────────────────────────────────
     def load_vehicles(self, vehicles: List[Vehicle]):
+        """Load vehicles into the sim. Anything mid-task is reset: there is no order bound to it."""
         for v in vehicles:
-            self._vehicles[v.vehicle_id] = VehicleSimState(v)
+            if v.status == VehicleStatus.BREAKDOWN:
+                v.status = VehicleStatus.MAINTENANCE
+            elif v.status not in (VehicleStatus.MAINTENANCE, VehicleStatus.OFFLINE):
+                v.status = VehicleStatus.AVAILABLE
+            v.current_order_id = None
+            v.current_load_kg = 0.0
+            v.current_eta_minutes = None
+            v.speed = 0.0
+            state = VehicleSimState(v)
+            if v.status == VehicleStatus.MAINTENANCE:
+                state.repair_remaining_sec = random.uniform(120, 600)
+            self._vehicles[v.vehicle_id] = state
         logger.info("Vehicles loaded into simulation", count=len(vehicles))
 
     def get_all_vehicles(self) -> List[Vehicle]:
@@ -218,8 +278,63 @@ class SimulationEngine:
         return list(self._orders.values())
 
     def get_pending_orders(self) -> List[Order]:
-        return [o for o in self._orders.values() if o.status == OrderStatus.PENDING]
+        pending = [o for o in self._orders.values() if o.status == OrderStatus.PENDING]
+        pending.sort(key=lambda o: o.created_at)
+        return pending
 
+    @property
+    def pending_count(self) -> int:
+        return sum(1 for o in self._orders.values() if o.status == OrderStatus.PENDING)
+
+    def get_incident(self, incident_id: str) -> Optional[Incident]:
+        return self._incidents.get(incident_id)
+
+    def traffic_factor(self, region: str) -> float:
+        return self._traffic.get(region, 1.0)
+
+    def expected_speed_kmh(self, vehicle: Vehicle) -> float:
+        """Speed we expect this vehicle to sustain right now in its region (used for ETAs)."""
+        region = vehicle.region or region_for_lng(vehicle.location.coordinates[0])
+        base = BASE_SPEED_KMH.get(region, 24.0) * TYPE_SPEED_FACTOR.get(vehicle.type.value, 1.0)
+        return max(5.0, base / max(self.traffic_factor(region), 0.6))
+
+    async def restore_orders(self, docs: List[dict]) -> dict:
+        """
+        Rebuild live order state after a restart. Orders that were in flight lose their
+        vehicle (vehicles restart idle) and go back to pending; stale pending orders expire.
+        """
+        stats = {"restored": 0, "requeued": 0, "expired": 0}
+        now = datetime.utcnow()
+        for doc in docs:
+            try:
+                order = Order(**{k: v for k, v in doc.items() if k != "_id"})
+            except Exception as e:
+                logger.warning("Skipping unreadable order", order_id=doc.get("order_id"), error=str(e))
+                continue
+            if order.status in (OrderStatus.DELIVERED, OrderStatus.FAILED, OrderStatus.CANCELLED):
+                continue
+            if order.region is None:
+                order.region = region_for_lng(order.pickup.location.coordinates[0])
+            if now - order.created_at > timedelta(hours=6):
+                order.status = OrderStatus.CANCELLED
+                await self._persist_order(order)
+                stats["expired"] += 1
+                continue
+            if order.status != OrderStatus.PENDING:
+                order.status = OrderStatus.PENDING
+                order.assigned_vehicle_id = None
+                order.assigned_at = None
+                order.eta_minutes = None
+                order.estimated_delivery_at = None
+                order.reassignment_count += 1
+                await self._persist_order(order)
+                stats["requeued"] += 1
+            self._orders[order.order_id] = order
+            stats["restored"] += 1
+        logger.info("Orders restored", **stats)
+        return stats
+
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
     def set_speed(self, speed: float):
         self.speed = max(0.1, min(speed, 20.0))
         logger.info("Simulation speed set", speed=self.speed)
@@ -240,6 +355,8 @@ class SimulationEngine:
                 await self._task
             except asyncio.CancelledError:
                 pass
+            self._task = None
+        await self._persist_vehicles()
 
     def pause(self):
         self.paused = True
@@ -252,307 +369,746 @@ class SimulationEngine:
             if not self.paused:
                 try:
                     await self._tick()
-                except Exception as e:
-                    logger.error("Sim tick error", error=str(e))
+                except Exception:
+                    logger.error("Sim tick error", exc_info=True)
             await asyncio.sleep(self.interval / max(self.speed, 0.1))
 
-    def _traffic_factor(self, is_delhi: bool) -> float:
-        """IST-approximate traffic multiplier based on hour."""
-        hour_ist = (datetime.utcnow().hour + 5) % 24
-        if 8 <= hour_ist <= 11 or 17 <= hour_ist <= 20:
-            base = random.uniform(1.7, 2.5) if not is_delhi else random.uniform(1.5, 2.2)
-        elif 13 <= hour_ist <= 15:
-            base = random.uniform(1.2, 1.5)
-        elif hour_ist < 7 or hour_ist > 22:
-            base = random.uniform(0.7, 1.0)
-        else:
-            base = random.uniform(1.0, 1.4)
-        return base * random.uniform(0.85, 1.15)
+    # ── Traffic ───────────────────────────────────────────────────────────────
+    def _target_traffic(self, region: str) -> float:
+        hour = ist_hour(datetime.utcnow())
+        peak = 1.9 if region == MUMBAI else 1.7
+        if 8 <= hour <= 11 or 17 <= hour <= 20:
+            return peak
+        if 13 <= hour <= 15:
+            return 1.3
+        if hour < 7 or hour > 22:
+            return 0.85
+        return 1.15
 
+    async def _update_traffic(self):
+        for region in REGIONS:
+            current = self._traffic_base[region]
+            target = self._target_traffic(region)
+            base = min(max(current + (target - current) * 0.05 + random.gauss(0, 0.01), 0.7), 2.6)
+            self._traffic_base[region] = base
+
+            surge = self._surges.get(region)
+            mult = 1.0
+            if surge:
+                surge["remaining_sec"] -= self.interval
+                ease = min(1.0, max(surge["remaining_sec"], 0.0) / (0.25 * surge["total_sec"]))
+                mult = 1.0 + (surge["multiplier"] - 1.0) * ease
+            self._traffic[region] = round(base * mult, 3)
+            if surge and surge["remaining_sec"] <= 0:
+                await self._end_surge(region)
+
+    async def _end_surge(self, region: str):
+        surge = self._surges.pop(region, None)
+        if not surge:
+            return
+        incident: Incident = surge["incident"]
+        if incident.status != IncidentStatus.RESOLVED:
+            at_risk = len(surge["at_risk"])
+            self._finish_incident(
+                incident,
+                note=f"Congestion cleared. {at_risk} order(s) were flagged SLA-at-risk during the surge.",
+                outcome=f"{at_risk} order(s) flagged SLA-at-risk",
+            )
+            await self._emit_incident(incident)
+        await broadcaster.broadcast(WSEventType.ALERT_CREATED, {
+            "type": "traffic_cleared", "message": f"Traffic back to normal in {region}.", "severity": "low",
+        })
+
+    async def trigger_traffic_event(self, region: Optional[str] = None) -> dict:
+        region = region if region in REGIONS else MUMBAI
+        affected = [s for s in self._vehicles.values()
+                    if s.region == region and s.vehicle.status == VehicleStatus.EN_ROUTE]
+        multiplier = round(random.uniform(1.8, 2.4), 2)
+        existing = self._surges.get(region)
+        if existing:                       # extend an ongoing surge instead of stacking incidents
+            existing["remaining_sec"] = existing["total_sec"] = SURGE_DURATION_SEC
+            existing["multiplier"] = max(existing["multiplier"], multiplier)
+        else:
+            corridor = "Western Express Highway" if region == MUMBAI else "NH-48 / Outer Ring Road"
+            incident = self._new_incident(
+                IncidentType.TRAFFIC_SPIKE, IncidentSeverity.HIGH,
+                title=f"Congestion surge - {region}",
+                description=(f"Heavy congestion on {corridor}. Traffic factor in {region} raised "
+                             f"{multiplier}x for about {SURGE_DURATION_SEC // 60} minutes."),
+                region=region,
+            )
+            incident.autonomous_actions.append(AutonomousAction(
+                action_type="recalculate_eta",
+                description=f"Recalculated ETAs for {len(affected)} en-route vehicle(s) at {multiplier}x traffic",
+                reason="Regional traffic factor changed",
+                expected_impact="ETAs and SLA-risk flags reflect slower travel",
+            ))
+            incident.status = IncidentStatus.ACTION_TAKEN
+            self._surges[region] = {
+                "multiplier": multiplier, "remaining_sec": SURGE_DURATION_SEC,
+                "total_sec": SURGE_DURATION_SEC, "incident": incident, "at_risk": set(),
+            }
+            await self._emit_incident(incident, is_new=True)
+        await broadcaster.broadcast(WSEventType.ALERT_CREATED, {
+            "type": "traffic_surge",
+            "message": f"Heavy congestion in {region}. {len(affected)} vehicles affected; ETAs recalculating.",
+            "severity": "high",
+            "affected_vehicles": len(affected),
+        })
+        logger.info("Traffic event triggered", region=region, affected=len(affected), multiplier=multiplier)
+        return {"region": region, "affected": len(affected), "multiplier": multiplier}
+
+    # ── Tick ──────────────────────────────────────────────────────────────────
     async def _tick(self):
         self.tick_count += 1
-        dt_hours = self.interval / 3600.0
+        await self._update_traffic()
 
-        # Generate new orders periodically
         self._order_gen_counter += 1
-        if self._order_gen_counter >= 10:
+        if self._order_gen_counter >= ORDER_GEN_EVERY_TICKS:
             self._order_gen_counter = 0
-            if random.random() < 0.7:
-                await self._generate_random_order()
+            if random.random() < ORDER_GEN_PROBABILITY:
+                await self.generate_random_order()
 
-        for state in self._vehicles.values():
-            state.traffic_factor = self._traffic_factor(state.is_delhi)
-            await self._update_vehicle(state, self.interval, dt_hours)
+        for state in list(self._vehicles.values()):
+            await self._update_vehicle(state)
 
-        await broadcaster.broadcast(WSEventType.FLEET_SNAPSHOT, self._build_fleet_snapshot())
+        if self.tick_count % DISPATCH_EVERY_TICKS == 0 and self.pending_count:
+            await self._request_dispatch(OptimizationTrigger.SCHEDULED)
 
-    async def _update_vehicle(self, state: VehicleSimState, dt_sec: float, dt_hours: float):
+        if self.tick_count % PERSIST_VEHICLES_EVERY_TICKS == 0:
+            await self._persist_vehicles()
+
+        await broadcaster.broadcast(WSEventType.FLEET_SNAPSHOT, self.build_fleet_snapshot())
+
+    async def _request_dispatch(self, trigger: OptimizationTrigger, **kwargs):
+        if self._dispatcher is None:
+            return None
+        try:
+            return await self._dispatcher(trigger, **kwargs)
+        except Exception:
+            logger.error("Dispatch failed", exc_info=True)
+            return None
+
+    # ── Vehicle update ────────────────────────────────────────────────────────
+    def vehicle_speed(self, state: VehicleSimState) -> float:
+        state.speed_noise = min(1.15, max(0.85, state.speed_noise + random.gauss(0, 0.02)))
+        return max(4.0, self.expected_speed_kmh(state.vehicle) * state.speed_noise)
+
+    def _consume_fuel(self, state: VehicleSimState, km: float):
         v = state.vehicle
+        rate = fuel_use_pct_per_km(v.fuel_type.value, v.type.value)
+        v.fuel_level = max(0.0, v.fuel_level - rate * km)
+        v.fuel_range_km = round(v.fuel_level / rate, 1) if rate else 0.0
+        v.odometer_km += km
+
+    def _drive(self, state: VehicleSimState, dt_hours: float) -> bool:
+        """Advance toward the current target. Returns True on arrival."""
+        v = state.vehicle
+        if state.target_lat is None or state.target_lng is None:
+            return True
+        speed = self.vehicle_speed(state)
+        v.speed = speed
+        lat, lng = state.lat, state.lng
+        new_lat, new_lng, arrived = move_toward(lat, lng, state.target_lat, state.target_lng, speed, dt_hours)
+        moved = haversine_km(lat, lng, new_lat, new_lng)
+        state.set_position(new_lat, new_lng)
+        state.order_distance_km += moved
+        self._consume_fuel(state, moved)
+        if not arrived:
+            v.heading = bearing(new_lat, new_lng, state.target_lat, state.target_lng)
+        else:
+            v.speed = 0.0
+        return arrived
+
+    async def _update_vehicle(self, state: VehicleSimState):
+        v = state.vehicle
+        dt_sec = self.interval
+        dt_hours = dt_sec / 3600.0
         now = datetime.utcnow()
 
-        if v.status in (VehicleStatus.OFFLINE, VehicleStatus.MAINTENANCE):
+        if v.status == VehicleStatus.OFFLINE:
             return
-        if v.status == VehicleStatus.BREAKDOWN:
+        if v.status in (VehicleStatus.BREAKDOWN, VehicleStatus.MAINTENANCE):
+            await self._tick_repair(state, dt_sec)
             return
-
-        # Breakdown risk: higher for older vehicles
-        bd_prob = 0.00015 * max(1.0, v.odometer_km / 100000)
-        if v.status == VehicleStatus.EN_ROUTE and random.random() < bd_prob:
-            await self._trigger_breakdown(state)
+        if state.phase == "refuelling":
+            await self._tick_refuel(state, dt_sec)
             return
 
-        if v.fuel_level < 10.0 and random.random() < 0.04:
-            await self._trigger_low_fuel_incident(state)
-
-        if state.phase in ("idle", "returning"):
-            await self._try_assign_order(state)
-        elif state.phase == "to_pickup":
-            await self._move_to_pickup(state, dt_hours)
-        elif state.phase == "at_pickup":
-            state.stop_timer += dt_sec
-            if state.stop_timer >= 110:  # Indian loading time
-                state.stop_timer = 0
-                state.phase = "to_delivery"
-                if state.current_order:
-                    state.current_order.status = OrderStatus.PICKED_UP
-                    state.set_target(
-                        state.current_order.delivery.location.coordinates[1],
-                        state.current_order.delivery.location.coordinates[0],
-                    )
-                    v.status = VehicleStatus.EN_ROUTE
-                    v.updated_at = now
-        elif state.phase == "to_delivery":
-            await self._move_to_delivery(state, dt_hours)
-        elif state.phase == "at_delivery":
-            state.stop_timer += dt_sec
-            if state.stop_timer >= 140:
-                state.stop_timer = 0
-                await self._complete_delivery(state)
-
-        # Fuel consumption by type
+        # Random mechanical failure while driving; older / unhealthy vehicles fail more often
         if v.status == VehicleStatus.EN_ROUTE:
-            fuel_rates = {"diesel": 0.09, "cng": 0.12, "electric": 0.18, "petrol": 0.10}
-            rate = fuel_rates.get(v.fuel_type.value, 0.09)
-            dist = v.speed * dt_hours
-            v.fuel_level = max(0.0, v.fuel_level - rate * dist)
-            v.odometer_km += dist
+            risk = BREAKDOWN_RATE_PER_TICK * max(1.0, v.odometer_km / 100000)
+            if v.health.overall_score < 50:
+                risk *= 3
+            if random.random() < risk:
+                await self._trigger_breakdown(state)
+                return
+            if v.fuel_level < CRITICAL_FUEL_PCT and state.low_fuel_incident is None:
+                await self._raise_low_fuel(state, en_route=True)
+
+        if state.current_order:
+            state.order_elapsed_min += dt_sec / 60.0
+
+        phase = state.phase
+        order = state.current_order
+        if phase == "idle":
+            v.status = VehicleStatus.AVAILABLE
+            v.speed = 0.0
+            if v.fuel_level < LOW_FUEL_PCT:
+                await self._start_refuel(state)
+        elif phase == "to_pickup" and order:
+            if order.status == OrderStatus.ASSIGNED:
+                order.status = OrderStatus.PICKUP_EN_ROUTE
+                await self._persist_order(order)
+            if self._drive(state, dt_hours):
+                state.phase = "at_pickup"
+                state.stop_timer = 0.0
+                v.status = VehicleStatus.LOADING
+        elif phase == "at_pickup" and order:
+            state.stop_timer += dt_sec
+            if state.stop_timer >= PICKUP_HANDLING_SEC:
+                state.stop_timer = 0.0
+                v.current_load_kg = order.weight_kg
+                order.status = OrderStatus.PICKED_UP
+                order.picked_up_at = now
+                state.phase = "to_delivery"
+                state.set_target(order.delivery.location.coordinates[1], order.delivery.location.coordinates[0])
+                v.status = VehicleStatus.EN_ROUTE
+                await self._persist_order(order)
+        elif phase == "to_delivery" and order:
+            if order.status == OrderStatus.PICKED_UP:
+                order.status = OrderStatus.DELIVERY_EN_ROUTE
+                await self._persist_order(order)
+            if self._drive(state, dt_hours):
+                state.phase = "at_delivery"
+                state.stop_timer = 0.0
+                v.status = VehicleStatus.UNLOADING
+        elif phase == "at_delivery" and order:
+            state.stop_timer += dt_sec
+            if state.stop_timer >= DELIVERY_HANDLING_SEC:
+                await self._complete_delivery(state)
+        elif phase != "idle" and not order:
+            # Defensive: a task phase with no order should never persist
+            state.phase = "idle"
+
+        if state.current_order:
+            await self._refresh_eta(state)
 
         v.updated_at = now
         state.telemetry_counter += 1
         if self._db is not None and state.telemetry_counter >= self.persist_interval:
             state.telemetry_counter = 0
-            await self._persist_telemetry(state)
+            if v.speed > 0:
+                await self._persist_telemetry(state)
 
-    async def _try_assign_order(self, state: VehicleSimState):
-        if not self._pending_orders:
-            state.vehicle.status = VehicleStatus.AVAILABLE
-            return
+    # ── ETA / SLA ─────────────────────────────────────────────────────────────
+    def estimate_order_minutes(self, vehicle: Vehicle, order: Order) -> float:
+        """Total minutes from now to delivery if `vehicle` took `order` (drive + handling)."""
+        speed = self.expected_speed_kmh(vehicle)
+        plat, plng = order.pickup.location.coordinates[1], order.pickup.location.coordinates[0]
+        dlat, dlng = order.delivery.location.coordinates[1], order.delivery.location.coordinates[0]
+        d = (haversine_km(vehicle.location.coordinates[1], vehicle.location.coordinates[0], plat, plng)
+             + haversine_km(plat, plng, dlat, dlng))
+        return d / speed * 60 + (PICKUP_HANDLING_SEC + DELIVERY_HANDLING_SEC) / 60
 
-        # Prefer same-region orders for geographic realism
-        region_orders = [o for o in self._pending_orders
-                        if (state.is_delhi and "Delhi" in (o.customer_id or ""))
-                        or not state.is_delhi]
-        candidates = region_orders if region_orders else self._pending_orders
-        if not candidates:
-            state.vehicle.status = VehicleStatus.AVAILABLE
+    def _remaining_eta_min(self, state: VehicleSimState) -> Optional[float]:
+        order = state.current_order
+        if not order:
+            return None
+        v = state.vehicle
+        speed = self.expected_speed_kmh(v)
+        plat, plng = order.pickup.location.coordinates[1], order.pickup.location.coordinates[0]
+        dlat, dlng = order.delivery.location.coordinates[1], order.delivery.location.coordinates[0]
+        trip = haversine_km(plat, plng, dlat, dlng)
+        if state.phase == "to_pickup":
+            d = haversine_km(state.lat, state.lng, plat, plng) + trip
+            handling = (PICKUP_HANDLING_SEC + DELIVERY_HANDLING_SEC) / 60
+        elif state.phase == "at_pickup":
+            d = trip
+            handling = (max(PICKUP_HANDLING_SEC - state.stop_timer, 0) + DELIVERY_HANDLING_SEC) / 60
+        elif state.phase == "to_delivery":
+            d = haversine_km(state.lat, state.lng, dlat, dlng)
+            handling = DELIVERY_HANDLING_SEC / 60
+        else:  # at_delivery
+            d = 0.0
+            handling = max(DELIVERY_HANDLING_SEC - state.stop_timer, 0) / 60
+        return d / speed * 60 + handling
+
+    async def _refresh_eta(self, state: VehicleSimState):
+        order = state.current_order
+        eta = self._remaining_eta_min(state)
+        if order is None or eta is None:
             return
-        order = candidates[0]
-        self._pending_orders.remove(order)
+        state.vehicle.current_eta_minutes = eta
+        order.eta_minutes = round(eta, 1)
+        # Deadlines are wall-clock; compare against wall-clock time remaining.
+        real_eta_min = eta / max(self.speed, 0.1)
+        order.estimated_delivery_at = datetime.utcnow() + timedelta(minutes=real_eta_min)
+        if order.deadline:
+            time_left = (order.deadline - datetime.utcnow()).total_seconds() / 60
+            at_risk = real_eta_min * 1.1 > time_left
+            if at_risk != order.sla_at_risk:
+                order.sla_at_risk = at_risk
+                await self._persist_order(order)
+                if at_risk and order.order_id not in self._sla_alerted:
+                    self._sla_alerted.add(order.order_id)
+                    surge = self._surges.get(state.region)
+                    if surge:
+                        surge["at_risk"].add(order.order_id)
+                    await broadcaster.broadcast(WSEventType.ALERT_CREATED, {
+                        "type": "sla_risk",
+                        "message": f"SLA at risk: {order.reference} ({order.customer_name})",
+                        "severity": "medium",
+                        "order_id": order.order_id,
+                    })
+
+    # ── Assignment (called by the optimization engine) ────────────────────────
+    async def assign_order(self, vehicle_id: str, order: Order) -> bool:
+        """Bind a pending order to an available vehicle. Check-and-set happens before any await."""
+        state = self._vehicles.get(vehicle_id)
+        if (state is None or state.vehicle.status != VehicleStatus.AVAILABLE or state.phase != "idle"
+                or order.status != OrderStatus.PENDING or order.order_id not in self._orders):
+            return False
+        v = state.vehicle
+        now = datetime.utcnow()
+
+        order.status = OrderStatus.ASSIGNED
+        order.assigned_vehicle_id = vehicle_id
+        order.assigned_driver_id = v.driver_id
+        order.assigned_at = now
+        order.region = order.region or state.region
+        eta = self.estimate_order_minutes(v, order)
+        order.predicted_eta_minutes = round(eta, 1)
+        order.eta_minutes = round(eta, 1)
+        order.estimated_delivery_at = now + timedelta(minutes=eta / max(self.speed, 0.1))
 
         state.current_order = order
-        order.status = OrderStatus.ASSIGNED
-        order.assigned_vehicle_id = state.vehicle.vehicle_id
-        order.assigned_at = datetime.utcnow()
-        state.set_target(
-            order.pickup.location.coordinates[1],
-            order.pickup.location.coordinates[0],
-        )
         state.phase = "to_pickup"
-        state.vehicle.status = VehicleStatus.EN_ROUTE
-        state.vehicle.current_order_id = order.order_id
-        state.vehicle.current_load_kg = order.weight_kg
-        self._orders[order.order_id] = order
+        state.order_elapsed_min = 0.0
+        state.order_distance_km = 0.0
+        state.stop_timer = 0.0
+        state.set_target(order.pickup.location.coordinates[1], order.pickup.location.coordinates[0])
+        v.status = VehicleStatus.EN_ROUTE
+        v.current_order_id = order.order_id
+        v.current_eta_minutes = eta
+        v.updated_at = now
 
+        await self._persist_order(order)
         await broadcaster.broadcast(WSEventType.ORDER_ASSIGNED, {
             "order_id": order.order_id,
-            "vehicle_id": state.vehicle.vehicle_id,
-            "vehicle_name": state.vehicle.name,
             "reference": order.reference,
+            "vehicle_id": vehicle_id,
+            "vehicle_name": v.name,
             "customer": order.customer_name,
             "priority": order.priority.value,
+            "eta_minutes": round(eta, 1),
         })
-
-    async def _move_to_pickup(self, state: VehicleSimState, dt_hours: float):
-        if state.target_lat is None:
-            return
-        speed = state.typical_speed()
-        state.vehicle.speed = speed
-        new_lat, new_lng, arrived = move_toward(state.lat, state.lng, state.target_lat, state.target_lng, speed, dt_hours)
-        state.set_position(new_lat, new_lng)
-        if state.target_lat and state.target_lng:
-            state.vehicle.heading = bearing(state.lat, state.lng, state.target_lat, state.target_lng)
-        if arrived:
-            state.phase = "at_pickup"
-            state.vehicle.status = VehicleStatus.LOADING
-            state.vehicle.speed = 0.0
-        else:
-            dist = haversine_km(state.lat, state.lng, state.target_lat, state.target_lng)
-            if speed > 0:
-                state.vehicle.current_eta_minutes = (dist / speed) * 60 + 18
-
-    async def _move_to_delivery(self, state: VehicleSimState, dt_hours: float):
-        if state.target_lat is None or state.current_order is None:
-            return
-        speed = state.typical_speed()
-        state.vehicle.speed = speed
-        new_lat, new_lng, arrived = move_toward(state.lat, state.lng, state.target_lat, state.target_lng, speed, dt_hours)
-        state.set_position(new_lat, new_lng)
-        if state.target_lat and state.target_lng:
-            state.vehicle.heading = bearing(state.lat, state.lng, state.target_lat, state.target_lng)
-        if arrived:
-            state.phase = "at_delivery"
-            state.vehicle.status = VehicleStatus.UNLOADING
-            state.vehicle.speed = 0.0
-        else:
-            dist = haversine_km(state.lat, state.lng, state.target_lat, state.target_lng)
-            if speed > 0:
-                eta_min = (dist / speed) * 60
-                state.vehicle.current_eta_minutes = eta_min
-                if state.current_order.deadline:
-                    deadline_in = (state.current_order.deadline - datetime.utcnow()).total_seconds() / 60
-                    state.current_order.sla_at_risk = eta_min > deadline_in * 0.9
+        return True
 
     async def _complete_delivery(self, state: VehicleSimState):
-        if not state.current_order:
-            return
         order = state.current_order
+        v = state.vehicle
+        if not order:
+            return
+        now = datetime.utcnow()
         order.status = OrderStatus.DELIVERED
-        order.delivered_at = datetime.utcnow()
-        state.vehicle.current_load_kg = 0.0
-        state.vehicle.current_order_id = None
-        state.vehicle.status = VehicleStatus.AVAILABLE
-        state.vehicle.current_eta_minutes = None
+        order.delivered_at = now
+        order.eta_minutes = None
+        order.sla_at_risk = False
+        order.actual_distance_km = round(state.order_distance_km, 2)
+        order.actual_duration_min = round(state.order_elapsed_min, 1)
+        on_time = order.deadline is None or now <= order.deadline
+
+        v.current_load_kg = 0.0
+        v.current_order_id = None
+        v.current_eta_minutes = None
+        v.status = VehicleStatus.AVAILABLE
+        v.speed = 0.0
         state.phase = "idle"
         state.current_order = None
+        state.stop_timer = 0.0
+
+        await self._persist_order(order)
+        self._orders.pop(order.order_id, None)
+        self._sla_alerted.discard(order.order_id)
+        if self._db is not None and v.driver_id:
+            try:
+                await self._db.drivers.update_one(
+                    {"driver_id": v.driver_id}, {"$inc": {"total_deliveries_today": 1}})
+            except Exception:
+                logger.warning("Driver stat update failed", exc_info=True)
         await broadcaster.broadcast(WSEventType.DELIVERY_COMPLETED, {
             "order_id": order.order_id,
-            "vehicle_id": state.vehicle.vehicle_id,
-            "vehicle_name": state.vehicle.name,
+            "vehicle_id": v.vehicle_id,
+            "vehicle_name": v.name,
             "reference": order.reference,
             "customer": order.customer_name,
-            "delivered_at": order.delivered_at.isoformat(),
+            "delivered_at": now.isoformat(),
+            "on_time": on_time,
         })
 
+    # ── Breakdown ─────────────────────────────────────────────────────────────
     async def _trigger_breakdown(self, state: VehicleSimState):
         v = state.vehicle
+        order = state.current_order
+        zone = nearest_zone_name(state.lat, state.lng)
+
         v.status = VehicleStatus.BREAKDOWN
         v.speed = 0.0
+        v.current_eta_minutes = None
         v.health.overall_score = random.uniform(4, 18)
         v.health.engine_temp = random.uniform(128, 168)
         state.phase = "idle"
-        is_delhi = state.is_delhi
-        road = random.choice(ROADS_DEL if is_delhi else ROADS_MUM)
-        area = random.choice(AREAS_DEL if is_delhi else AREAS_MUM)
-        incident = Incident(
-            incident_id=f"INC-{uuid.uuid4().hex[:8].upper()}",
-            type=IncidentType.VEHICLE_BREAKDOWN,
-            severity=IncidentSeverity.HIGH,
-            status=IncidentStatus.DETECTED,
-            title=f"Breakdown: {v.name} on {road}",
-            description=f"Vehicle {v.name} has suffered engine failure near {area}. Engine temperature critical at {v.health.engine_temp:.0f}°C. Roadside assistance dispatched. Active delivery will be reassigned.",
-            vehicle_id=v.vehicle_id,
-            order_ids=[v.current_order_id] if v.current_order_id else [],
-        )
-        for cb in self._on_incident_callbacks:
-            await cb(incident)
-        asyncio.create_task(self._recover_vehicle(state, delay=random.randint(90, 300)))
-        logger.warning("Vehicle breakdown triggered", vehicle=v.name, vehicle_id=v.vehicle_id)
+        state.repair_remaining_sec = random.uniform(300, 900)
 
-    async def _recover_vehicle(self, state: VehicleSimState, delay: int):
-        await asyncio.sleep(delay / max(self.speed, 1))
+        incident = self._new_incident(
+            IncidentType.VEHICLE_BREAKDOWN, IncidentSeverity.HIGH,
+            title=f"Breakdown: {v.name} near {zone}",
+            description=(f"{v.name} ({v.registration or v.vehicle_id}) stopped with engine failure near {zone}. "
+                         f"Engine temperature {v.health.engine_temp:.0f}\u00b0C."),
+            vehicle=v, region=state.region,
+            order_ids=[order.order_id] if order else [],
+        )
+        incident.timeline.append(IncidentTimelineEntry(
+            timestamp=datetime.utcnow(), event="Telemetry flagged engine failure",
+            details=f"Engine temp {v.health.engine_temp:.0f}\u00b0C, health score {v.health.overall_score:.0f}/100"))
+        state.breakdown_incident = incident
+        await self._emit_incident(incident, is_new=True)
+
+        if order:
+            await self._release_order_after_breakdown(state, order, incident)
+        else:
+            incident.status = IncidentStatus.MONITORING
+            incident.timeline.append(IncidentTimelineEntry(
+                timestamp=datetime.utcnow(), event="No active delivery on this vehicle",
+                details="Roadside assistance dispatched"))
+            await self._emit_incident(incident)
+        logger.warning("Vehicle breakdown", vehicle=v.name, vehicle_id=v.vehicle_id, had_order=bool(order))
+
+    async def _release_order_after_breakdown(self, state: VehicleSimState, order: Order, incident: Incident):
+        """Take the order off the broken vehicle and ask the dispatcher to re-home it."""
         v = state.vehicle
+        cargo_on_board = order.status in (OrderStatus.PICKED_UP, OrderStatus.DELIVERY_EN_ROUTE)
+        if cargo_on_board:
+            # Replacement vehicle must collect the cargo from the breakdown site.
+            order.pickup = AddressPoint(
+                address=f"Breakdown site - {v.name}",
+                location=GeoPoint(coordinates=[state.lng, state.lat]),
+                notes="Cargo transfer from broken-down vehicle",
+            )
+        order.status = OrderStatus.PENDING
+        order.assigned_vehicle_id = None
+        order.assigned_driver_id = None
+        order.assigned_at = None
+        order.eta_minutes = None
+        order.sla_at_risk = False
+        order.reassignment_count += 1
+        v.current_order_id = None
+        v.current_load_kg = 0.0
+        state.current_order = None
+        state.order_elapsed_min = 0.0
+        state.order_distance_km = 0.0
+        await self._persist_order(order)
+
+        incident.timeline.append(IncidentTimelineEntry(
+            timestamp=datetime.utcnow(), event=f"Order {order.reference} released for reassignment",
+            details="Cargo transfer required at breakdown site" if cargo_on_board else "Not yet picked up"))
+        incident.status = IncidentStatus.ANALYZING
+        await self._emit_incident(incident)
+
+        await self._request_dispatch(
+            OptimizationTrigger.VEHICLE_BREAKDOWN,
+            triggering_vehicle_id=v.vehicle_id, triggering_incident_id=incident.incident_id)
+
+        new_vehicle = self.get_vehicle(order.assigned_vehicle_id) if order.assigned_vehicle_id else None
+        if new_vehicle and order.status == OrderStatus.ASSIGNED:
+            eta = order.eta_minutes or 0
+            incident.autonomous_actions.append(AutonomousAction(
+                action_type="reassign_order",
+                description=f"Order {order.reference} reassigned to {new_vehicle.name}",
+                vehicle_id=new_vehicle.vehicle_id, order_id=order.order_id,
+                reason=f"{v.name} broke down while carrying the order",
+                expected_impact=f"New delivery ETA about {eta:.0f} min",
+                outcome="Reassigned successfully",
+            ))
+            incident.timeline.append(IncidentTimelineEntry(
+                timestamp=datetime.utcnow(), event=f"Reassigned to {new_vehicle.name}",
+                details=f"ETA {eta:.0f} min", actor="optimizer"))
+            incident.status = IncidentStatus.ACTION_TAKEN
+            incident.sla_impact = "At risk" if order.sla_at_risk else "None expected"
+        else:
+            incident.autonomous_actions.append(AutonomousAction(
+                action_type="queue_order",
+                description=f"No suitable vehicle free - {order.reference} queued for next available",
+                order_id=order.order_id,
+                reason="No available vehicle satisfies capacity / region / cold-chain constraints",
+                expected_impact="Order is dispatched as soon as a vehicle frees up",
+            ))
+            incident.timeline.append(IncidentTimelineEntry(
+                timestamp=datetime.utcnow(), event="No vehicle available - order queued", actor="optimizer"))
+            incident.status = IncidentStatus.MONITORING
+            incident.sla_impact = "At risk"
+        await self._emit_incident(incident)
+
+    async def _tick_repair(self, state: VehicleSimState, dt_sec: float):
+        v = state.vehicle
+        state.repair_remaining_sec -= dt_sec
+        if state.repair_remaining_sec > 0:
+            return
         if v.status == VehicleStatus.BREAKDOWN:
             v.status = VehicleStatus.MAINTENANCE
             v.health.engine_temp = 88.0
-            await asyncio.sleep(60 / max(self.speed, 1))
-            v.status = VehicleStatus.AVAILABLE
-            v.fuel_level = max(v.fuel_level, 50.0)
-            v.health.overall_score = 70.0
-            state.phase = "idle"
-            logger.info("Vehicle recovered", vehicle=v.name)
+            state.repair_remaining_sec = 120.0
+            incident = state.breakdown_incident
+            if incident and incident.status != IncidentStatus.RESOLVED:
+                incident.timeline.append(IncidentTimelineEntry(
+                    timestamp=datetime.utcnow(), event="Roadside repair complete - vehicle in workshop check"))
+                await self._emit_incident(incident)
+            return
+        # MAINTENANCE finished
+        v.status = VehicleStatus.AVAILABLE
+        v.fuel_level = max(v.fuel_level, 50.0)
+        v.health.overall_score = max(v.health.overall_score, 70.0)
+        state.phase = "idle"
+        incident = state.breakdown_incident
+        state.breakdown_incident = None
+        if incident and incident.status != IncidentStatus.RESOLVED:
+            self._finish_incident(incident, note=f"{v.name} repaired and back in service",
+                                  outcome="Vehicle returned to service")
+            await self._emit_incident(incident)
+        logger.info("Vehicle recovered", vehicle=v.name)
 
-    async def _trigger_low_fuel_incident(self, state: VehicleSimState):
+    # ── Fuel ──────────────────────────────────────────────────────────────────
+    async def _raise_low_fuel(self, state: VehicleSimState, en_route: bool):
         v = state.vehicle
-        fuel_label = "battery charge" if v.fuel_type.value == "electric" else "CNG level" if v.fuel_type.value == "cng" else "fuel level"
+        label = "battery charge" if v.fuel_type.value == "electric" else "fuel"
+        incident = self._new_incident(
+            IncidentType.LOW_BATTERY if v.fuel_type.value == "electric" else IncidentType.LOW_FUEL,
+            IncidentSeverity.MEDIUM,
+            title=f"Low {label}: {v.name}",
+            description=f"{v.name} {label} at {v.fuel_level:.1f}%.",
+            vehicle=v, region=state.region,
+            order_ids=[state.current_order.order_id] if state.current_order else [],
+        )
+        if en_route:
+            incident.autonomous_actions.append(AutonomousAction(
+                action_type="schedule_refuel",
+                description="Refuel scheduled immediately after the current delivery",
+                vehicle_id=v.vehicle_id, reason=f"{label.capitalize()} below {CRITICAL_FUEL_PCT:.0f}%",
+                expected_impact="Vehicle is not offered new orders until refuelled"))
+            incident.status = IncidentStatus.ACTION_TAKEN
+        state.low_fuel_incident = incident
+        await self._emit_incident(incident, is_new=True)
+
+    async def _start_refuel(self, state: VehicleSimState):
+        v = state.vehicle
+        if state.low_fuel_incident is None:
+            await self._raise_low_fuel(state, en_route=False)
+        incident = state.low_fuel_incident
+        state.phase = "refuelling"
+        state.refuel_remaining_sec = REFUEL_SEC
+        v.status = VehicleStatus.IDLE      # not dispatchable while refuelling
+        v.speed = 0.0
+        if incident:
+            incident.autonomous_actions.append(AutonomousAction(
+                action_type="refuel",
+                description=f"{v.name} taken out of dispatch to refuel/recharge",
+                vehicle_id=v.vehicle_id, reason=f"Level {v.fuel_level:.0f}% is below {LOW_FUEL_PCT:.0f}%",
+                expected_impact=f"Back in service in about {REFUEL_SEC // 60} min"))
+            incident.status = IncidentStatus.ACTION_TAKEN
+            incident.timeline.append(IncidentTimelineEntry(
+                timestamp=datetime.utcnow(), event="Vehicle sent to refuel", actor="system"))
+            await self._emit_incident(incident)
+
+    async def _tick_refuel(self, state: VehicleSimState, dt_sec: float):
+        v = state.vehicle
+        state.refuel_remaining_sec -= dt_sec
+        if state.refuel_remaining_sec > 0:
+            return
+        v.fuel_level = 100.0 if v.fuel_type.value == "electric" else 95.0
+        rate = fuel_use_pct_per_km(v.fuel_type.value, v.type.value)
+        v.fuel_range_km = round(v.fuel_level / rate, 1)
+        v.status = VehicleStatus.AVAILABLE
+        state.phase = "idle"
+        incident = state.low_fuel_incident
+        state.low_fuel_incident = None
+        if incident and incident.status != IncidentStatus.RESOLVED:
+            self._finish_incident(incident, note=f"{v.name} refuelled to {v.fuel_level:.0f}%",
+                                  outcome="Refuelled")
+            await self._emit_incident(incident)
+
+    # ── Incidents ─────────────────────────────────────────────────────────────
+    def _new_incident(self, itype: IncidentType, severity: IncidentSeverity, title: str, description: str,
+                      vehicle: Optional[Vehicle] = None, region: Optional[str] = None,
+                      order_ids: Optional[List[str]] = None) -> Incident:
         incident = Incident(
             incident_id=f"INC-{uuid.uuid4().hex[:8].upper()}",
-            type=IncidentType.LOW_FUEL,
-            severity=IncidentSeverity.MEDIUM,
-            status=IncidentStatus.DETECTED,
-            title=f"Low {fuel_label.title()}: {v.name}",
-            description=f"Vehicle {v.name} {fuel_label} at {v.fuel_level:.1f}%. Nearest IOCL/CNG station assigned.",
-            vehicle_id=v.vehicle_id,
+            type=itype, severity=severity, status=IncidentStatus.DETECTED,
+            title=title, description=description,
+            vehicle_id=vehicle.vehicle_id if vehicle else None,
+            vehicle_name=vehicle.name if vehicle else None,
+            driver_id=vehicle.driver_id if vehicle else None,
+            region=region,
+            order_ids=order_ids or [],
+            detected_by="simulation",
+            timeline=[IncidentTimelineEntry(timestamp=datetime.utcnow(), event="Incident detected")],
         )
+        self._incidents[incident.incident_id] = incident
+        return incident
+
+    def _finish_incident(self, incident: Incident, note: str, outcome: Optional[str] = None,
+                         actor: str = "system"):
+        now = datetime.utcnow()
+        incident.status = IncidentStatus.RESOLVED
+        incident.resolved_at = now
+        incident.resolution_notes = note
+        incident.timeline.append(IncidentTimelineEntry(timestamp=now, event="Incident resolved",
+                                                       details=note, actor=actor))
+        if outcome and incident.autonomous_actions:
+            last = incident.autonomous_actions[-1]
+            if not last.outcome:
+                last.outcome = outcome
+
+    async def _emit_incident(self, incident: Incident, is_new: bool = False):
+        incident.updated_at = datetime.utcnow()
         for cb in self._on_incident_callbacks:
-            await cb(incident)
+            try:
+                await cb(incident, is_new)
+            except Exception:
+                logger.error("Incident callback failed", exc_info=True)
+        # Bound memory: keep only recent resolved incidents
+        if len(self._incidents) > 300:
+            for iid in [i for i, inc in self._incidents.items() if inc.status == IncidentStatus.RESOLVED][:100]:
+                self._incidents.pop(iid, None)
 
-    async def _generate_random_order(self):
-        # Pick region randomly (40% Delhi, 60% Mumbai by default)
-        if random.random() < 0.4:
-            pickup_zone = random.choice(DELHI_NCR_ZONES)
-            delivery_zone = random.choice(DELHI_NCR_ZONES)
-            ref_prefix = "DEL"
+    async def resolve_incident(self, incident_id: str, username: str, notes: Optional[str] = None) -> bool:
+        """Manual resolution of a live incident. Returns False if it is not in memory."""
+        incident = self._incidents.get(incident_id)
+        if incident is None:
+            return False
+        if incident.status != IncidentStatus.RESOLVED:
+            self._finish_incident(incident, note=notes or f"Resolved manually by {username}",
+                                  actor=f"user:{username}")
+            await self._emit_incident(incident)
+        return True
+
+    async def trigger_breakdown_event(self, vehicle_id: Optional[str] = None) -> Optional[str]:
+        if vehicle_id:
+            state = self._vehicles.get(vehicle_id)
+            if state is None or state.vehicle.status in (VehicleStatus.BREAKDOWN, VehicleStatus.OFFLINE):
+                return None
         else:
-            pickup_zone = random.choice(MUMBAI_ZONES)
-            delivery_zone = random.choice(MUMBAI_ZONES)
-            ref_prefix = "MUM"
+            candidates = [s for s in self._vehicles.values() if s.vehicle.status == VehicleStatus.EN_ROUTE]
+            if not candidates:
+                return None
+            state = random.choice(candidates)
+        await self._trigger_breakdown(state)
+        return state.vehicle.vehicle_id
 
+    # ── Orders ────────────────────────────────────────────────────────────────
+    def _max_capacity(self, region: str) -> float:
+        caps = [s.vehicle.max_capacity_kg for s in self._vehicles.values() if s.region == region]
+        return max(caps) if caps else 0.0
+
+    async def generate_random_order(self, region: Optional[str] = None, dispatch: bool = True) -> Optional[Order]:
+        if region not in REGIONS:
+            region = DELHI if random.random() < 0.4 else MUMBAI
+        zones = ZONES_BY_REGION[region]
+        pickup_zone, delivery_zone = random.choice(zones), random.choice(zones)
         plat, plng = random_point(pickup_zone)
         dlat, dlng = random_point(delivery_zone)
-        customer = random.choice(INDIAN_COMPANIES)
 
+        weight = random_cargo_weight()
+        max_cap = self._max_capacity(region)
+        if max_cap and weight > max_cap:
+            weight = round(random.uniform(5, max_cap * 0.8), 1)
         priority = random.choices(
             [OrderPriority.LOW, OrderPriority.NORMAL, OrderPriority.HIGH, OrderPriority.CRITICAL],
-            weights=[12, 50, 30, 8]
-        )[0]
+            weights=[12, 50, 30, 8])[0]
+        slack = {OrderPriority.CRITICAL: (1.2, 1.8), OrderPriority.HIGH: (1.4, 2.4),
+                 OrderPriority.NORMAL: (1.8, 3.2), OrderPriority.LOW: (2.5, 4.0)}[priority]
+        trip_km = haversine_km(plat, plng, dlat, dlng)
+        base_min = (trip_km + 4.0) / BASE_SPEED_KMH[region] * 60 + (PICKUP_HANDLING_SEC + DELIVERY_HANDLING_SEC) / 60
+        deadline = datetime.utcnow() + timedelta(minutes=30 + base_min * random.uniform(*slack))
+        customer = random.choice(INDIAN_COMPANIES)
+        prefix = "DEL" if region == DELHI else "MUM"
 
         order = Order(
             order_id=f"ord-{uuid.uuid4().hex[:12]}",
-            reference=f"{ref_prefix}-{datetime.utcnow().strftime('%y%m%d')}-{random.randint(1000,9999)}",
+            reference=f"{prefix}-{datetime.utcnow().strftime('%y%m%d')}-{random.randint(1000, 9999)}",
             status=OrderStatus.PENDING,
             priority=priority,
             customer_name=customer,
-            pickup=AddressPoint(
-                address=make_indian_address(pickup_zone),
-                location=GeoPoint(coordinates=[plng, plat]),
-            ),
-            delivery=AddressPoint(
-                address=make_indian_address(delivery_zone),
-                location=GeoPoint(coordinates=[dlng, dlat]),
-            ),
-            weight_kg=random.uniform(5, 1200),
+            region=region,
+            pickup=AddressPoint(address=make_indian_address(pickup_zone), location=GeoPoint(coordinates=[plng, plat])),
+            delivery=AddressPoint(address=make_indian_address(delivery_zone), location=GeoPoint(coordinates=[dlng, dlat])),
+            weight_kg=weight,
+            requires_refrigeration=random.random() < 0.05,
             description=f"Shipment for {customer}",
-            deadline=datetime.utcnow() + timedelta(hours=random.randint(2, 10)),
+            deadline=deadline,
+            estimated_distance_km=round(trip_km, 1),
         )
+        await self.add_order(order, dispatch=dispatch)
+        return order
 
+    async def add_order(self, order: Order, dispatch: bool = True):
+        """Register a new pending order (persist, announce, ask for dispatch)."""
+        order.region = order.region or region_for_lng(order.pickup.location.coordinates[0])
         self._orders[order.order_id] = order
-        self._pending_orders.append(order)
-
-        if self._db is not None:
-            try:
-                await self._db.orders.insert_one(order.model_dump())
-            except Exception:
-                pass
-
+        await self._persist_order(order)
         await broadcaster.broadcast(WSEventType.ORDER_CREATED, {
             "order_id": order.order_id,
             "reference": order.reference,
             "customer": order.customer_name,
             "priority": order.priority.value,
             "weight_kg": round(order.weight_kg, 1),
+            "region": order.region,
         })
         for cb in self._on_order_callbacks:
             await cb(order)
+        if dispatch:
+            await self._request_dispatch(OptimizationTrigger.NEW_ORDER, triggering_order_id=order.order_id)
+
+    async def seed_initial_orders(self, count: int = 24):
+        """Give a freshly started system some work so the first screen is not empty."""
+        for _ in range(count):
+            await self.generate_random_order(dispatch=False)
+        await self._request_dispatch(OptimizationTrigger.SCHEDULED)
+
+    # ── Persistence ───────────────────────────────────────────────────────────
+    async def _persist_order(self, order: Order):
+        order.updated_at = datetime.utcnow()
+        if self._db is None:
+            return
+        try:
+            await self._db.orders.replace_one({"order_id": order.order_id}, order.model_dump(), upsert=True)
+        except Exception:
+            logger.error("Failed to persist order", order_id=order.order_id, exc_info=True)
+
+    async def _persist_vehicles(self):
+        if self._db is None or not self._vehicles:
+            return
+        ops = []
+        for s in self._vehicles.values():
+            v = s.vehicle
+            ops.append(UpdateOne({"vehicle_id": v.vehicle_id}, {"$set": {
+                "location": v.location.model_dump(),
+                "status": v.status.value,
+                "speed": v.speed,
+                "heading": v.heading,
+                "fuel_level": v.fuel_level,
+                "fuel_range_km": v.fuel_range_km,
+                "current_load_kg": v.current_load_kg,
+                "current_order_id": v.current_order_id,
+                "current_eta_minutes": v.current_eta_minutes,
+                "odometer_km": v.odometer_km,
+                "health": v.health.model_dump(),
+                "updated_at": datetime.utcnow(),
+            }}))
+        try:
+            await self._db.vehicles.bulk_write(ops, ordered=False)
+        except Exception:
+            logger.error("Failed to persist vehicles", exc_info=True)
 
     async def _persist_telemetry(self, state: VehicleSimState):
         if self._db is None:
@@ -575,14 +1131,16 @@ class SimulationEngine:
                 "eta_minutes": v.current_eta_minutes,
             })
         except Exception:
-            pass
+            logger.warning("Failed to persist telemetry", exc_info=True)
 
-    def _build_fleet_snapshot(self):
+    # ── Snapshot ──────────────────────────────────────────────────────────────
+    def build_fleet_snapshot(self) -> dict:
         return {
             "vehicles": [
                 {
                     "vehicle_id": s.vehicle.vehicle_id,
                     "name": s.vehicle.name,
+                    "type": s.vehicle.type.value,
                     "status": s.vehicle.status.value,
                     "lat": s.lat,
                     "lng": s.lng,
@@ -590,42 +1148,22 @@ class SimulationEngine:
                     "heading": round(s.vehicle.heading, 1),
                     "fuel_level": round(s.vehicle.fuel_level, 1),
                     "current_load_kg": round(s.vehicle.current_load_kg, 1),
+                    "max_capacity_kg": s.vehicle.max_capacity_kg,
                     "current_order_id": s.vehicle.current_order_id,
                     "eta_minutes": round(s.vehicle.current_eta_minutes, 1) if s.vehicle.current_eta_minutes else None,
                     "health_score": round(s.vehicle.health.overall_score, 1),
-                    "region": "Delhi NCR" if s.is_delhi else "Mumbai MMR",
+                    "region": s.region,
                 }
                 for s in self._vehicles.values()
             ],
             "tick": self.tick_count,
             "sim_speed": self.speed,
-            "pending_orders": len(self._pending_orders),
+            "paused": self.paused,
+            "pending_orders": self.pending_count,
+            "traffic": {r: round(f, 2) for r, f in self._traffic.items()},
         }
 
-    async def trigger_traffic_event(self):
-        count = 0
-        for state in self._vehicles.values():
-            if state.vehicle.status == VehicleStatus.EN_ROUTE:
-                state.traffic_factor = random.uniform(2.0, 3.0)
-                count += 1
-        region_msg = "Western Express Highway (Mumbai) and NH-48 (Delhi NCR)" if count > 3 else "Western Express Highway"
-        await broadcaster.broadcast(WSEventType.ALERT_CREATED, {
-            "type": "traffic_surge",
-            "message": f"Heavy congestion on {region_msg}. {count} vehicles affected. ETAs recalculating.",
-            "severity": "high",
-            "affected_vehicles": count,
-        })
-        logger.info("Traffic event triggered", affected=count)
-
-    async def trigger_breakdown_event(self, vehicle_id=None):
-        if vehicle_id and vehicle_id in self._vehicles:
-            state = self._vehicles[vehicle_id]
-        else:
-            candidates = [s for s in self._vehicles.values() if s.vehicle.status == VehicleStatus.EN_ROUTE]
-            if not candidates:
-                return
-            state = random.choice(candidates)
-        await self._trigger_breakdown(state)
+    _build_fleet_snapshot = build_fleet_snapshot   # backwards-compatible alias
 
 
 simulation_engine = SimulationEngine()

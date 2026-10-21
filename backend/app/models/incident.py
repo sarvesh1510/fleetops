@@ -66,6 +66,8 @@ class Incident(BaseModel):
 
     # Affected entities
     vehicle_id: Optional[str] = None
+    vehicle_name: Optional[str] = None
+    region: Optional[str] = None
     driver_id: Optional[str] = None
     order_ids: List[str] = Field(default_factory=list)
     route_id: Optional[str] = None

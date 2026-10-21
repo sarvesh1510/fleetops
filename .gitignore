@@ -34,3 +34,6 @@ frontend/.vite/
 
 # MongoDB
 mongo_data/
+
+# Local dev data
+.mongo-data/

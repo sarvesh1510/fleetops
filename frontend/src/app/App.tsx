@@ -1,54 +1,44 @@
-import { useEffect } from 'react'
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { lazy, Suspense, useEffect } from 'react'
+import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
+import { QueryClientProvider } from '@tanstack/react-query'
 import { useAuthStore } from '../stores/authStore'
 import { useWSStore } from '../stores/wsStore'
+import { queryClient } from '../lib/queryClient'
 import AppLayout from '../components/layout/AppLayout'
 import LoginPage from '../pages/LoginPage'
-import DashboardPage from '../pages/DashboardPage'
-import FleetPage from '../pages/FleetPage'
-import OrdersPage from '../pages/OrdersPage'
-import IncidentsPage from '../pages/IncidentsPage'
-import { OptimizationPage, AnalyticsPage, PredictionsPage } from '../pages/AnalyticsPages'
+import { LoadingRows } from '../components/ui'
 
-const qc = new QueryClient({
-  defaultOptions: {
-    queries: {
-      retry: 1,
-      staleTime: 5000,
-    },
-  },
-})
+// Route-level code splitting keeps the first load small (charts and the map load on demand)
+const DashboardPage = lazy(() => import('../pages/DashboardPage'))
+const FleetPage = lazy(() => import('../pages/FleetPage'))
+const OrdersPage = lazy(() => import('../pages/OrdersPage'))
+const IncidentsPage = lazy(() => import('../pages/IncidentsPage'))
+const OptimizationPage = lazy(() => import('../pages/OptimizationPage'))
+const AnalyticsPage = lazy(() => import('../pages/AnalyticsPage'))
+const PredictionsPage = lazy(() => import('../pages/PredictionsPage'))
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated } = useAuthStore()
+  const isAuthenticated = useAuthStore(s => s.isAuthenticated)
   return isAuthenticated ? <>{children}</> : <Navigate to="/login" replace />
 }
 
-function AppInit({ children }: { children: React.ReactNode }) {
-  const { loadFromStorage, isAuthenticated } = useAuthStore()
+/** Keeps the live socket open exactly while signed in. */
+function LiveConnection() {
+  const isAuthenticated = useAuthStore(s => s.isAuthenticated)
   const { connect, disconnect } = useWSStore()
-
   useEffect(() => {
-    loadFromStorage()
-  }, [loadFromStorage])
-
-  useEffect(() => {
-    if (isAuthenticated) {
-      connect()
-    } else {
-      disconnect()
-    }
+    if (isAuthenticated) connect()
+    else disconnect()
   }, [isAuthenticated, connect, disconnect])
-
-  return <>{children}</>
+  return null
 }
 
 export default function App() {
   return (
-    <QueryClientProvider client={qc}>
+    <QueryClientProvider client={queryClient}>
       <BrowserRouter>
-        <AppInit>
+        <LiveConnection />
+        <Suspense fallback={<LoadingRows rows={8} />}>
           <Routes>
             <Route path="/login" element={<LoginPage />} />
             <Route path="/" element={<ProtectedRoute><AppLayout /></ProtectedRoute>}>
@@ -62,7 +52,7 @@ export default function App() {
             </Route>
             <Route path="*" element={<Navigate to="/" replace />} />
           </Routes>
-        </AppInit>
+        </Suspense>
       </BrowserRouter>
     </QueryClientProvider>
   )
