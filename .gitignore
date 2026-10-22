@@ -1,39 +1,31 @@
-# Environment
-.env
-.env.local
-.env.*.local
+Environment files
 
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-.venv/
-venv/
-*.egg-info/
-dist/
-build/
-.pytest_cache/
-.mypy_cache/
-htmlcov/
-.coverage
+.env .env.* !.env.example
 
-# Node
-node_modules/
-frontend/dist/
-frontend/.vite/
+Python
 
-# IDE
-.vscode/
-.idea/
-*.swp
-*.swo
-.DS_Store
+pycache/ *.py[cod] *.pyo .venv/ venv/ .egg-info/ dist/ build/ .pytest_cache/ .mypy_cache/ .ruff_cache/ htmlcov/ .coverage .coverage.
 
-# Docker
+Node
+
+node_modules/ frontend/dist/ frontend/.vite/
+
+IDE
+
+.vscode/ .idea/ *.swp *.swo .DS_Store
+
+Docker and logs
+
 *.log
 
-# MongoDB
-mongo_data/
+MongoDB and local development data
 
-# Local dev data
-.mongo-data/
+mongo_data/ .mongo-data/
+
+Testing and coverage
+
+coverage/ .nyc_output/
+
+OS files
+
+Thumbs.db
