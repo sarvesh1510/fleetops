@@ -60,19 +60,6 @@ On first start the database is seeded with users, the fleet and 320 historical d
 
 ---
 
-## Demo accounts
-
-| Username | Password | Role | Can |
-|---|---|---|---|
-| `admin` | `Admin123!` | Admin | everything |
-| `ops_manager` | `Ops123!` | Ops Manager | simulation controls, dispatch, orders, incidents |
-| `dispatcher` | `Dispatch123!` | Dispatcher | create orders, resolve incidents, run dispatch |
-| `viewer` | `Viewer123!` | Viewer | read-only |
-
-These are demo credentials. Change `JWT_SECRET` and the seeded users before exposing the app to anyone.
-
----
-
 ## Using the demo
 
 Open the **Simulation** menu (top right of the Dashboard):
