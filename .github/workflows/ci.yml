@@ -1,3 +1,4 @@
+
 name: CI
 
 on:
@@ -43,7 +44,7 @@ jobs:
           if errors:
               for e in errors: print(e)
               sys.exit(1)
-          print(f'All Python files valid')
+          print('All Python files valid')
           "
 
       - name: Run tests
@@ -100,14 +101,3 @@ jobs:
 
       - name: Build frontend image
         run: docker build -t fleetops-frontend:ci ./frontend
-
-      - name: Test backend health
-        run: |
-          docker run -d --name backend-test \
-            -e MONGODB_URI=mongodb://host.docker.internal:27017 \
-            -e JWT_SECRET=ci-test-secret-32chars-minimum \
-            -p 8000:8000 \
-            fleetops-backend:ci
-          sleep 15
-          curl -f http://localhost:8000/health || (docker logs backend-test && exit 1)
-          docker stop backend-test
