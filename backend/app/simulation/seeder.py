@@ -197,7 +197,7 @@ async def _seed_users(db):
     now = datetime.utcnow()
     users = [
         {"user_id": "usr-admin-001", "username": "admin", "email": "admin@fleetops.in",
-         "full_name": "Arjun Mehta", "role": "admin",
+         "full_name": "Sarvesh Bhardwaj", "role": "admin",
          "hashed_password": _hash("***REMOVED***"), "is_active": True, "created_at": now, "updated_at": now},
         {"user_id": "usr-ops-001", "username": "ops_manager", "email": "ops@fleetops.in",
          "full_name": "Priya Sharma", "role": "operations_manager",
