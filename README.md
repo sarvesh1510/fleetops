@@ -12,7 +12,7 @@ Everything is simulated: vehicles, telemetry, orders and incidents are generated
 
 | Area | Behaviour |
 |---|---|
-| **Simulation** | 2-second ticks, 1x/2x/5x/10x speed, pause/resume. Vehicles drive pickup → delivery, load/unload, refuel when low, and get slowed by regional traffic. |
+| **Simulation** | 2-second ticks, 1x/2x/5x/10x speed, pause/resume. Vehicles drive pickup → delivery along real roads (OSRM routing, straight-line fallback if unreachable), load/unload, refuel when low, and get slowed by regional traffic. |
 | **Dispatch** | New orders, breakdowns and a 30 s schedule trigger a dispatch run. Vehicles are only matched inside their own region and must satisfy capacity, cold-chain and fuel-range constraints. |
 | **Incidents** | A breakdown creates an incident with a timeline, reassigns the vehicle's active order through the dispatcher, and can be resolved with notes. Traffic surges create (and later expire) regional incidents. |
 | **Orders** | Create orders (cross-region and out-of-region coordinates are rejected), follow status transitions, see assignment and ETA. |

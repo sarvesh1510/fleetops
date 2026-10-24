@@ -28,6 +28,12 @@ class Settings(BaseSettings):
     SIMULATION_INTERVAL_SECONDS: float = 2.0
     TELEMETRY_PERSIST_INTERVAL: int = 10  # persist every Nth telemetry update
 
+    # Road routing (OSRM). Vehicles follow real roads when enabled, straight lines otherwise.
+    ROUTING_ENABLED: bool = True
+    ROUTING_BASE_URL: str = "https://router.project-osrm.org"   # public demo server; self-host for heavy use
+    ROUTING_TIMEOUT_SECONDS: float = 8.0
+    ROUTING_MIN_INTERVAL_SECONDS: float = 1.0   # spacing between requests (demo server allows ~1 req/s)
+
     # Optimization
     OPTIMIZATION_INTERVAL_SECONDS: int = 30
     OPTIMIZATION_IMPROVEMENT_THRESHOLD: float = 0.05  # 5% improvement required

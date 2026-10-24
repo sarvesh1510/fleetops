@@ -56,11 +56,28 @@ function tooltipHtml(v: LiveVehicle): string {
   )
 }
 
+interface Anim {
+  from: L.LatLng
+  to: L.LatLng
+  start: number
+  duration: number
+}
+
+/** Jumps larger than this (metres) are teleports (e.g. a vehicle returning from repair): don't glide. */
+const MAX_GLIDE_M = 1500
+
 export default function FleetMap({ region, selectedVehicleId, onSelect }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const mapRef = useRef<L.Map | null>(null)
   const markersRef = useRef<Map<string, { marker: L.Marker; iconKey: string }>>(new Map())
   const fittedRegionRef = useRef<Region | 'all' | null>(null)
+
+  // Positions arrive every simulation tick (~2 s). Instead of hopping marker-to-marker we glide
+  // from where the marker is now to the new position over the time between snapshots.
+  const animsRef = useRef<Map<string, Anim>>(new Map())
+  const lastMapRef = useRef<Map<string, LiveVehicle> | null>(null)
+  const lastSnapshotAtRef = useRef(0)
+  const glideMsRef = useRef(2000)
 
   const vehicleMap = useWSStore(s => s.vehicleMap)
 
@@ -119,6 +136,18 @@ export default function FleetMap({ region, selectedVehicleId, onSelect }: Props)
     const map = mapRef.current
     if (!map) return
 
+    // Learn how often snapshots arrive so the glide lasts exactly one interval.
+    const now = performance.now()
+    if (lastMapRef.current !== vehicleMap) {
+      if (lastSnapshotAtRef.current) {
+        const dt = now - lastSnapshotAtRef.current
+        glideMsRef.current = Math.min(4000, Math.max(150, 0.5 * glideMsRef.current + 0.5 * dt))
+      }
+      lastSnapshotAtRef.current = now
+      lastMapRef.current = vehicleMap
+    }
+    const anims = animsRef.current
+
     const inRegion = (v: LiveVehicle) => region === 'all' || v.region === region
     const live = new Set<string>()
 
@@ -130,7 +159,15 @@ export default function FleetMap({ region, selectedVehicleId, onSelect }: Props)
       const existing = markersRef.current.get(id)
 
       if (existing) {
-        existing.marker.setLatLng([v.lat, v.lng])
+        const next = L.latLng(v.lat, v.lng)
+        const shown = existing.marker.getLatLng()
+        const dist = shown.distanceTo(next)
+        if (dist > MAX_GLIDE_M) {
+          existing.marker.setLatLng(next)
+          anims.delete(id)
+        } else if (dist > 0.5) {
+          anims.set(id, { from: shown, to: next, start: now, duration: glideMsRef.current })
+        }
         if (existing.iconKey !== key) {
           existing.marker.setIcon(buildIcon(v.status, v.heading ?? 0, selected))
           existing.iconKey = key
@@ -153,9 +190,31 @@ export default function FleetMap({ region, selectedVehicleId, onSelect }: Props)
       if (!live.has(id)) {
         entry.marker.remove()
         markersRef.current.delete(id)
+        anims.delete(id)
       }
     })
   }, [vehicleMap, region, selectedVehicleId])
+
+  // ── Animation loop: move markers along their current glide ───────────────────
+  useEffect(() => {
+    let frame = 0
+    const step = (t: number) => {
+      const anims = animsRef.current
+      anims.forEach((a, id) => {
+        const entry = markersRef.current.get(id)
+        if (!entry) { anims.delete(id); return }
+        const p = Math.min(1, (t - a.start) / a.duration)
+        entry.marker.setLatLng([
+          a.from.lat + (a.to.lat - a.from.lat) * p,
+          a.from.lng + (a.to.lng - a.from.lng) * p,
+        ])
+        if (p >= 1) anims.delete(id)
+      })
+      frame = requestAnimationFrame(step)
+    }
+    frame = requestAnimationFrame(step)
+    return () => cancelAnimationFrame(frame)
+  }, [])
 
   // ── Gently pan to the selected vehicle (no forced zoom-out) ──────────────────
   useEffect(() => {

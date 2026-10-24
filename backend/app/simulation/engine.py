@@ -21,7 +21,7 @@ import math
 import random
 import uuid
 from datetime import datetime, timedelta
-from typing import Awaitable, Callable, Dict, List, Optional
+from typing import Awaitable, Callable, Dict, List, Optional, Tuple
 
 import structlog
 from pymongo import UpdateOne
@@ -34,6 +34,7 @@ from app.models.incident import (
 from app.models.optimization import OptimizationTrigger
 from app.models.order import AddressPoint, Order, OrderPriority, OrderStatus
 from app.models.vehicle import GeoPoint, Vehicle, VehicleStatus
+from app.simulation.routing import road_router
 from app.utils.cargo import random_cargo_weight
 from app.utils.geo import (  # re-exported for callers/tests
     DELHI, MUMBAI, REGIONS, bearing, haversine_km, ist_hour, region_for_lng,
@@ -114,6 +115,9 @@ PERSIST_VEHICLES_EVERY_TICKS = 15
 
 # Typical free-flow city speed (km/h) by region and by vehicle type.
 BASE_SPEED_KMH = {MUMBAI: 24.0, DELHI: 30.0}
+# Road distance is longer than the straight line; used for ETAs before/without a real route.
+ROAD_CIRCUITY = 1.3
+
 TYPE_SPEED_FACTOR = {
     "van": 1.0, "truck": 0.85, "cargo_bike": 1.15, "motorcycle": 1.3, "refrigerated": 0.95,
 }
@@ -137,6 +141,32 @@ def move_toward(lat, lng, tlat, tlng, speed_kmh, dt_hours):
         return tlat, tlng, True
     ratio = travel / dist
     return lat + (tlat - lat) * ratio, lng + (tlng - lng) * ratio, False
+
+
+def advance_along_path(lat, lng, path, idx, travel_km):
+    """
+    Walk `travel_km` along `path` (list of (lat, lng)) starting at (lat, lng), whose next
+    waypoint is path[idx]. Returns (lat, lng, next_idx); next_idx == len(path) means arrived.
+    """
+    while travel_km > 0 and idx < len(path):
+        wlat, wlng = path[idx]
+        d = haversine_km(lat, lng, wlat, wlng)
+        if d <= travel_km:
+            lat, lng = wlat, wlng
+            travel_km -= d
+            idx += 1
+        else:
+            f = travel_km / d
+            return lat + (wlat - lat) * f, lng + (wlng - lng) * f, idx
+    return lat, lng, idx
+
+
+def path_suffix_km(path) -> List[float]:
+    """suffix[i] = length of the path from path[i] to its end (suffix[-1] == 0)."""
+    suffix = [0.0] * len(path)
+    for i in range(len(path) - 2, -1, -1):
+        suffix[i] = suffix[i + 1] + haversine_km(path[i][0], path[i][1], path[i + 1][0], path[i + 1][1])
+    return suffix
 
 
 def random_point(zone, radius_km=1.8):
@@ -176,6 +206,12 @@ class VehicleSimState:
         vehicle.region = self.region
         self.target_lat: Optional[float] = None
         self.target_lng: Optional[float] = None
+        # Road path to the target: list of (lat, lng); path_i is the next waypoint to reach
+        self.path: Optional[List[Tuple[float, float]]] = None
+        self.path_i: int = 0
+        self.path_suffix: List[float] = []
+        self.route_task: Optional[asyncio.Task] = None
+        self.route_gen: int = 0
         self.phase: str = "idle"   # idle|to_pickup|at_pickup|to_delivery|at_delivery|refuelling
         self.current_order: Optional[Order] = None
         self.stop_timer: float = 0.0
@@ -208,6 +244,32 @@ class VehicleSimState:
     def set_target(self, lat, lng):
         self.target_lat = lat
         self.target_lng = lng
+        self.clear_route()
+
+    # ── Route following ───────────────────────────────────────────────────────
+    def clear_route(self):
+        """Forget the current path (new target, breakdown, delivery done)."""
+        self.route_gen += 1
+        if self.route_task is not None and not self.route_task.done():
+            self.route_task.cancel()
+        self.route_task = None
+        self.path = None
+        self.path_i = 0
+        self.path_suffix = []
+
+    def set_path(self, path):
+        self.path = path
+        self.path_i = 1 if len(path) > 1 else 0     # path[0] is where the vehicle already is
+        self.path_suffix = path_suffix_km(path)
+
+    def remaining_path_km(self) -> Optional[float]:
+        """Distance still to drive along the current path, or None if there is no path yet."""
+        if self.path is None:
+            return None
+        if self.path_i >= len(self.path):
+            return 0.0
+        wlat, wlng = self.path[self.path_i]
+        return haversine_km(self.lat, self.lng, wlat, wlng) + self.path_suffix[self.path_i]
 
 
 IncidentCallback = Callable[[Incident, bool], Awaitable[None]]
@@ -356,6 +418,9 @@ class SimulationEngine:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        for s in self._vehicles.values():
+            s.clear_route()
+        await road_router.aclose()
         await self._persist_vehicles()
 
     def pause(self):
@@ -501,24 +566,68 @@ class SimulationEngine:
         v.fuel_range_km = round(v.fuel_level / rate, 1) if rate else 0.0
         v.odometer_km += km
 
+    def _ensure_route(self, state: VehicleSimState) -> bool:
+        """
+        Make sure the vehicle has a path to its target. Returns True when one is ready.
+        With routing on, the road path is fetched in the background and the vehicle waits
+        (stationary) until it arrives; with routing off it is a straight line, immediately.
+        """
+        if state.path is not None:
+            return True
+        tlat, tlng = state.target_lat, state.target_lng
+        if not road_router.enabled:
+            state.set_path([(state.lat, state.lng), (tlat, tlng)])
+            return True
+        if state.route_task is None:
+            state.route_task = asyncio.create_task(self._fetch_route(state, state.route_gen, tlat, tlng))
+        return False
+
+    async def _fetch_route(self, state: VehicleSimState, gen: int, tlat: float, tlng: float):
+        start = (state.lat, state.lng)
+        try:
+            points = await road_router.route(start, (tlat, tlng))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.error("Route fetch failed", exc_info=True)
+            points = None
+        if gen != state.route_gen:          # target changed / vehicle stopped while we waited
+            return
+        if points:
+            # The route starts on the nearest road. Snap onto it if that is close, otherwise
+            # keep the real start so the vehicle does not teleport.
+            if haversine_km(start[0], start[1], points[0][0], points[0][1]) > 0.5:
+                points = [start] + points
+            else:
+                state.set_position(*points[0])
+        else:
+            points = [start, (tlat, tlng)]   # routing unavailable: straight line
+        state.set_path(points)
+
     def _drive(self, state: VehicleSimState, dt_hours: float) -> bool:
-        """Advance toward the current target. Returns True on arrival."""
+        """Advance along the path to the current target. Returns True on arrival."""
         v = state.vehicle
         if state.target_lat is None or state.target_lng is None:
             return True
+        if not self._ensure_route(state):
+            v.speed = 0.0                    # waiting for the road route
+            return False
         speed = self.vehicle_speed(state)
         v.speed = speed
         lat, lng = state.lat, state.lng
-        new_lat, new_lng, arrived = move_toward(lat, lng, state.target_lat, state.target_lng, speed, dt_hours)
+        new_lat, new_lng, state.path_i = advance_along_path(
+            lat, lng, state.path, state.path_i, speed * dt_hours)
         moved = haversine_km(lat, lng, new_lat, new_lng)
         state.set_position(new_lat, new_lng)
         state.order_distance_km += moved
         self._consume_fuel(state, moved)
-        if not arrived:
-            v.heading = bearing(new_lat, new_lng, state.target_lat, state.target_lng)
-        else:
+        if state.path_i >= len(state.path):
             v.speed = 0.0
-        return arrived
+            return True
+        wlat, wlng = state.path[state.path_i]
+        if haversine_km(new_lat, new_lng, wlat, wlng) > 0.002:
+            v.heading = bearing(new_lat, new_lng, wlat, wlng)
+        return False
 
     async def _update_vehicle(self, state: VehicleSimState):
         v = state.vehicle
@@ -602,13 +711,17 @@ class SimulationEngine:
                 await self._persist_telemetry(state)
 
     # ── ETA / SLA ─────────────────────────────────────────────────────────────
+    def _road_factor(self) -> float:
+        """Straight-line to road-distance multiplier (1.0 when vehicles move in straight lines)."""
+        return ROAD_CIRCUITY if road_router.enabled else 1.0
+
     def estimate_order_minutes(self, vehicle: Vehicle, order: Order) -> float:
         """Total minutes from now to delivery if `vehicle` took `order` (drive + handling)."""
         speed = self.expected_speed_kmh(vehicle)
         plat, plng = order.pickup.location.coordinates[1], order.pickup.location.coordinates[0]
         dlat, dlng = order.delivery.location.coordinates[1], order.delivery.location.coordinates[0]
         d = (haversine_km(vehicle.location.coordinates[1], vehicle.location.coordinates[0], plat, plng)
-             + haversine_km(plat, plng, dlat, dlng))
+             + haversine_km(plat, plng, dlat, dlng)) * self._road_factor()
         return d / speed * 60 + (PICKUP_HANDLING_SEC + DELIVERY_HANDLING_SEC) / 60
 
     def _remaining_eta_min(self, state: VehicleSimState) -> Optional[float]:
@@ -617,17 +730,23 @@ class SimulationEngine:
             return None
         v = state.vehicle
         speed = self.expected_speed_kmh(v)
+        k = self._road_factor()
         plat, plng = order.pickup.location.coordinates[1], order.pickup.location.coordinates[0]
         dlat, dlng = order.delivery.location.coordinates[1], order.delivery.location.coordinates[0]
-        trip = haversine_km(plat, plng, dlat, dlng)
+        trip = haversine_km(plat, plng, dlat, dlng) * k
         if state.phase == "to_pickup":
-            d = haversine_km(state.lat, state.lng, plat, plng) + trip
+            leg = state.remaining_path_km()
+            if leg is None:
+                leg = haversine_km(state.lat, state.lng, plat, plng) * k
+            d = leg + trip
             handling = (PICKUP_HANDLING_SEC + DELIVERY_HANDLING_SEC) / 60
         elif state.phase == "at_pickup":
             d = trip
             handling = (max(PICKUP_HANDLING_SEC - state.stop_timer, 0) + DELIVERY_HANDLING_SEC) / 60
         elif state.phase == "to_delivery":
-            d = haversine_km(state.lat, state.lng, dlat, dlng)
+            d = state.remaining_path_km()
+            if d is None:
+                d = haversine_km(state.lat, state.lng, dlat, dlng) * k
             handling = DELIVERY_HANDLING_SEC / 60
         else:  # at_delivery
             d = 0.0
@@ -760,6 +879,7 @@ class SimulationEngine:
         v.health.engine_temp = random.uniform(128, 168)
         state.phase = "idle"
         state.repair_remaining_sec = random.uniform(300, 900)
+        state.clear_route()
 
         incident = self._new_incident(
             IncidentType.VEHICLE_BREAKDOWN, IncidentSeverity.HIGH,
