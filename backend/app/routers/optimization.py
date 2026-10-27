@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 from app.core.auth import get_current_user, require_dispatcher_or_above
 from app.db.database import get_db
-from app.ml.models import ml_engine
+from app.ml.models import error_stats, ml_engine
 from app.models.optimization import OptimizationTrigger
 from app.optimization.engine import optimization_engine
 from app.simulation.engine import simulation_engine
@@ -255,7 +255,7 @@ async def predict_eta(
     predicted, confidence = ml_engine.eta_predictor.predict(
         distance_km=distance_km,
         speed_kmh=speed_kmh,
-        hour=now.hour,
+        hour=now.hour + now.minute / 60.0,
         day_of_week=now.weekday(),
         n_stops=n_stops,
         traffic_factor=traffic_factor,
@@ -270,7 +270,80 @@ async def predict_eta(
         "range_min": round(max(predicted - spread, 1.0), 1),
         "range_max": round(predicted + spread, 1),
         "confidence_pct": confidence,
-        "model": "eta_xgboost_v2",
+        "model": "eta_xgboost_v3",
+    }
+
+
+def _improvement_pct(baseline_mae: Optional[float], ml_mae: Optional[float]) -> Optional[float]:
+    """How much lower the ML model's mean error is than a baseline's (positive = ML is better)."""
+    if not baseline_mae or ml_mae is None:
+        return None
+    return round((baseline_mae - ml_mae) / baseline_mae * 100, 1)
+
+
+@ml_router.get("/eta-evaluation")
+async def eta_evaluation(
+    limit: int = Query(200, ge=10, le=1000, description="Most recent delivered orders to score"),
+    current_user: dict = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    """
+    How good is the ETA model? Two views of the same question:
+
+    * held_out - the model vs two simple estimates on unseen synthetic trips (set aside before training)
+    * live     - the estimates made when orders were assigned vs how long those orders really took in
+                 the simulation (only orders assigned after the ML model came online have all three)
+    """
+    eta = ml_engine.eta_predictor
+    held_out = None
+    if eta.is_trained and eta.evaluation:
+        methods = eta.evaluation["methods"]
+        held_out = {
+            "samples": eta.evaluation["samples"],
+            "methods": methods,
+            "ml_vs_formula_pct": _improvement_pct(methods["formula"]["mae"], methods["ml"]["mae"]),
+            "ml_vs_fixed_speed_pct": _improvement_pct(methods["fixed_speed"]["mae"], methods["ml"]["mae"]),
+        }
+
+    docs = await db.orders.find(
+        {"status": "delivered", "ml_eta_minutes": {"$gt": 0}, "formula_eta_minutes": {"$gt": 0},
+         "fixed_speed_eta_minutes": {"$gt": 0}, "actual_duration_min": {"$gt": 0}},
+        {"_id": 0, "reference": 1, "ml_eta_minutes": 1, "formula_eta_minutes": 1,
+         "fixed_speed_eta_minutes": 1, "actual_duration_min": 1, "delivered_at": 1},
+    ).sort("delivered_at", -1).limit(limit).to_list(limit)
+    docs.reverse()  # oldest -> newest for charting
+
+    live_methods = None
+    ml_vs_formula = ml_vs_fixed = None
+    if docs:
+        actual = [d["actual_duration_min"] for d in docs]
+        live_methods = {
+            "ml": error_stats(actual, [d["ml_eta_minutes"] for d in docs]),
+            "formula": error_stats(actual, [d["formula_eta_minutes"] for d in docs]),
+            "fixed_speed": error_stats(actual, [d["fixed_speed_eta_minutes"] for d in docs]),
+        }
+        ml_vs_formula = _improvement_pct(live_methods["formula"]["mae"], live_methods["ml"]["mae"])
+        ml_vs_fixed = _improvement_pct(live_methods["fixed_speed"]["mae"], live_methods["ml"]["mae"])
+
+    return {
+        "model_ready": eta.is_trained,
+        "held_out": held_out,
+        "live": {
+            "samples": len(docs),
+            "methods": live_methods,
+            "ml_vs_formula_pct": ml_vs_formula,
+            "ml_vs_fixed_speed_pct": ml_vs_fixed,
+            "points": [
+                {
+                    "order_ref": d.get("reference", ""),
+                    "ml_min": round(d["ml_eta_minutes"], 1),
+                    "formula_min": round(d["formula_eta_minutes"], 1),
+                    "actual_min": round(d["actual_duration_min"], 1),
+                    "delivered_at": d.get("delivered_at"),
+                }
+                for d in docs
+            ],
+        },
     }
 
 

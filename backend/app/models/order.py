@@ -72,9 +72,16 @@ class Order(BaseModel):
     # ETA tracking
     estimated_delivery_at: Optional[datetime] = None
     eta_minutes: Optional[float] = None
-    # ETA (minutes, pickup + delivery legs) computed at assignment time, and the
+    # ETA (minutes, pickup + delivery legs) quoted at assignment time, and the
     # simulated minutes it actually took. Used for real ETA-accuracy analytics.
+    # `predicted_eta_minutes` is the quote in use: the ML model's once it has trained,
+    # otherwise the simple formula (`eta_source` says which).
     predicted_eta_minutes: Optional[float] = None
+    eta_source: Optional[str] = None
+    # The three estimates made at assignment, kept so each can be scored against the real time.
+    ml_eta_minutes: Optional[float] = None
+    formula_eta_minutes: Optional[float] = None
+    fixed_speed_eta_minutes: Optional[float] = None
     actual_duration_min: Optional[float] = None
     sla_at_risk: bool = False
     reassignment_count: int = 0

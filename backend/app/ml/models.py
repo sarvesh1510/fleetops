@@ -1,13 +1,15 @@
 """
 Machine Learning Module
 
-Models are trained at startup on synthetic data that mirrors Mumbai MMR and
-Delhi NCR delivery patterns (IST peak hours, weekend relief, monsoon-style congestion).
+All models are trained at startup on synthetic data. The ETA model is trained on trips
+generated with the simulator's own rules (speeds, rush hours, stop handling), so its
+numbers describe how well it learned that simulated world, not real-world accuracy.
 
 Model 1: ETA Prediction (XGBoost regression, monotone-constrained)
-  - Inputs: distance, free-flow speed, hour, day, stops, vehicle_type, traffic, load
-  - Output: estimated delivery duration in minutes
-  - Metric: MAE, RMSE (on a held-out split)
+  - Inputs: distance, free-flow speed, time of day, stops, vehicle type, traffic, sim speed
+  - Output: minutes from order assignment to delivery
+  - Used by the simulation engine to quote the ETA of every newly assigned order
+  - Metric: MAE, RMSE on held-out trips, next to a simple formula and a fixed-speed guess
 
 Model 2: Demand Forecast (gradient boosting)
   - Inputs: hour, day_of_week, zone
@@ -17,9 +19,6 @@ Model 2: Demand Forecast (gradient boosting)
 Model 3: Anomaly Detection (Isolation Forest)
   - Inputs: speed, fuel_consumption_rate, stop_duration, route_deviation, engine temp
   - Output: anomaly_score (lower = more anomalous) and a flag
-
-NOTE: These are genuinely trained models, but on synthetic data - the metrics
-describe how well they learned that synthetic world, not real-world accuracy.
 """
 
 import random
@@ -35,6 +34,13 @@ from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import LabelEncoder
 import structlog
 
+from app.simulation.profile import (
+    BASE_SPEED_KMH, DELIVERY_HANDLING_SEC, PICKUP_HANDLING_SEC, ROAD_CIRCUITY, TRAFFIC_TABLE,
+    TYPE_SPEED_FACTOR, VEHICLE_TYPES, fixed_speed_eta_minutes, formula_eta_minutes, region_index,
+    handling_minutes, trip_window_hours, typical_traffic_ahead,
+)
+from app.utils.geo import DELHI, MUMBAI
+
 warnings.filterwarnings("ignore")
 
 try:
@@ -47,91 +53,182 @@ except ImportError:
 logger = structlog.get_logger(__name__)
 
 
+
+def error_stats(actual, predicted) -> Dict[str, float]:
+    """Mean absolute error and root-mean-square error, in the unit of the inputs (minutes)."""
+    err = np.asarray(predicted, dtype=float) - np.asarray(actual, dtype=float)
+    return {
+        "mae": round(float(np.mean(np.abs(err))), 2),
+        "rmse": round(float(np.sqrt(np.mean(err ** 2))), 2),
+    }
+
+
 class ETAPredictor:
     """
-    Predicts delivery duration given route and context features.
+    Predicts how long an order takes from assignment to delivery (drive to the pickup,
+    load, drive to the customer, unload).
 
-    Trained on synthetic history that mirrors Mumbai MMR / Delhi NCR delivery patterns
-    (IST peak hours, weekend relief). The model takes the vehicle's *free-flow* speed
-    (what it would do on empty roads) and the *traffic factor* (congestion multiplier)
-    as independent inputs, and is constrained to be monotonic: more distance, more
-    stops or more traffic can never shorten the ETA, and a faster vehicle can never
-    lengthen it.
+    How it works (in plain terms): the simple formula is
+        minutes = distance / (free-flow speed / congestion) + handling time
+    and the only thing it gets wrong is `congestion`, because it uses the reading from the
+    moment of assignment. The XGBoost model's job is to predict the congestion the trip will
+    actually meet on average - e.g. higher when rush hour starts part-way through the trip.
+    That prediction is then dropped into the same formula.
+
+    Trained on trips generated with the simulator's own rules (see app/simulation/profile.py):
+    regional speeds, vehicle-type speeds, congestion by IST hour, handling time at stops.
+    Each training trip is "driven" in 30-second steps, so traffic really does change part-way
+    through, and the recorded congestion is whatever the trip actually experienced.
+
+    Inputs: congestion now (`traffic_factor`), typical congestion over the time window the trip
+    will occupy (`traffic_ahead`), the time of day and the length of that window. Distance,
+    speed and stops stay in the formula, so more distance, more stops or a slower vehicle can
+    never shorten the ETA, and the congestion estimate is constrained so that more traffic now
+    never lowers it.
+
+    `hour_of_day` is fractional IST time (10.5 = 10:30). `sim_speed` is the simulation speed
+    multiplier: at 10x a trip lasts a tenth of the wall-clock time, so the traffic profile
+    changes less during it. Day of week, vehicle type and load do not change travel time in the
+    simulated world, so they are not model inputs.
     """
+
+    # Simulation speeds the live system can run at, with how often each is seen in training.
+    SIM_SPEEDS = (1.0, 2.0, 5.0, 10.0)
+    SIM_SPEED_WEIGHTS = (0.5, 0.2, 0.15, 0.15)
 
     def __init__(self) -> None:
         self.model = None
         self.is_trained = False
         self.mae: Optional[float] = None
         self.rmse: Optional[float] = None
+        # Same held-out trips scored three ways: ML model, simple formula, fixed-speed guess
+        self.evaluation: Optional[Dict] = None
         self.feature_names = [
-            "distance_km", "free_flow_speed_kmh", "hour_of_day", "day_of_week",
-            "n_stops", "vehicle_type_enc", "traffic_factor", "weight_kg_norm",
+            "traffic_factor", "traffic_ahead", "hour_of_day", "window_hours",
         ]
-        # +1 = prediction must not decrease as the feature grows, -1 = must not increase
-        self.monotone_constraints = (1, -1, 0, 0, 1, 0, 1, 0)
+        # +1 = the predicted congestion must not fall as the feature grows
+        self.monotone_constraints = (1, 1, 0, 0)
 
-    def _generate_training_data(self, n_samples: int = 6000) -> pd.DataFrame:
-        """Synthetic delivery history: duration = distance / (free-flow / traffic) + stop handling + noise."""
+    def _generate_training_data(self, n_samples: int = 8000) -> pd.DataFrame:
+        """Drive `n_samples` simulated trips in 30-second steps and record how long each took."""
         rng = np.random.default_rng(42)
-        rows = []
-        for _ in range(n_samples):
-            distance_km = rng.uniform(1.5, 28.0)
-            hour = int(rng.integers(6, 22))
-            day = int(rng.integers(0, 7))
-            n_stops = int(rng.integers(1, 8))
-            vehicle_type = int(rng.integers(0, 5))
-            weight_kg_norm = rng.uniform(0.0, 1.0)
+        n = n_samples
+        dt = 0.5                                        # minutes per step
 
-            # Congestion by IST hour (Mumbai/Delhi style peaks)
-            if hour in (9, 10, 18, 19):
-                traffic = rng.uniform(1.6, 2.4)
-            elif hour in (12, 13, 14):
-                traffic = rng.uniform(1.2, 1.6)
-            elif hour < 7 or hour > 21:
-                traffic = rng.uniform(0.7, 1.0)
-            else:
-                traffic = rng.uniform(1.0, 1.4)
-            if day >= 5:  # weekend
-                traffic *= 0.75
+        delhi = rng.random(n) < 0.4
+        region_idx = delhi.astype(int)
+        vtype = rng.integers(0, len(VEHICLE_TYPES), n)
+        type_factor = np.array([TYPE_SPEED_FACTOR[t] for t in VEHICLE_TYPES])[vtype]
+        base_speed = np.where(delhi, BASE_SPEED_KMH[DELHI], BASE_SPEED_KMH[MUMBAI])
+        free_flow = base_speed * type_factor
 
-            # Free-flow speed is a property of the vehicle/road, independent of congestion
-            free_flow = rng.uniform(22, 48)
-            effective_speed = free_flow / traffic
-            duration = (distance_km / effective_speed) * 60
-            duration += n_stops * rng.uniform(4, 12)           # handling per stop
-            duration += rng.normal(0, 3)
-            duration = max(duration, 5.0)
+        # Trip: vehicle -> pickup -> customer. Distances follow what the simulation's orders look
+        # like (zone-to-zone inside one region: mostly 8-30 km, up to ~50 km). The app only knows
+        # an *estimated* road distance; the road actually driven differs a little from it.
+        pickup_km = np.clip(rng.gamma(2.0, 2.5, n), 0.3, 25.0)
+        trip_km = np.where(rng.random(n) < 0.06,
+                           rng.uniform(0.5, 4.0, n),
+                           np.clip(rng.gamma(3.0, 6.2, n), 4.0, 52.0))
+        est_km = (pickup_km + trip_km) * ROAD_CIRCUITY
+        road_noise = rng.lognormal(0.0, 0.08, n)
+        rem1 = pickup_km * ROAD_CIRCUITY * road_noise
+        rem2 = trip_km * ROAD_CIRCUITY * road_noise
 
-            rows.append({
-                "distance_km": distance_km,
-                "free_flow_speed_kmh": free_flow,
-                "hour_of_day": hour,
-                "day_of_week": day,
-                "n_stops": n_stops,
-                "vehicle_type_enc": vehicle_type,
-                "traffic_factor": traffic,
-                "weight_kg_norm": weight_kg_norm,
-                "duration_minutes": duration,
-            })
-        return pd.DataFrame(rows)
+        n_stops = rng.choice([1, 2, 3, 4, 5, 6, 8], size=n, p=[0.05, 0.55, 0.12, 0.10, 0.08, 0.05, 0.05])
+        extra_handling = (n_stops - 1) * DELIVERY_HANDLING_SEC / 60
+        start_hour = rng.uniform(0.0, 24.0, n)
+        day = rng.integers(0, 7, n)
+        weight_norm = rng.uniform(0.0, 1.0, n)
+        sim_speed = rng.choice(self.SIM_SPEEDS, size=n, p=self.SIM_SPEED_WEIGHTS)
+
+        # Congestion by region and hour comes straight from the simulator's own profile.
+        def traffic_at(t_min: np.ndarray) -> np.ndarray:
+            wall_hour = (start_hour + t_min / (60.0 * sim_speed)) % 24.0
+            base = TRAFFIC_TABLE[region_idx, wall_hour.astype(int)] + rng.normal(0, 0.02, n)
+            return np.clip(base, 0.7, 2.6)
+
+        traffic_now = traffic_at(np.zeros(n))
+        window_hours = trip_window_hours(region_idx, start_hour, est_km, free_flow, n_stops, sim_speed)
+        traffic_ahead = typical_traffic_ahead(region_idx, start_hour, window_hours)
+
+        t = np.zeros(n)
+        phase = np.zeros(n, dtype=int)                  # 0 drive to pickup, 1 load, 2 drive to customer, 3 unload, 4 done
+        hold = np.zeros(n)                              # handling minutes left in phases 1 and 3
+        noise = rng.uniform(0.85, 1.15, n)              # the vehicle's speed wobble
+        for _ in range(3000):
+            active = phase < 4
+            if not active.any():
+                break
+            noise = np.clip(noise + rng.normal(0, 0.055, n), 0.85, 1.15)
+            traffic = traffic_at(t)
+            speed = np.maximum(4.0, np.maximum(5.0, free_flow / np.maximum(traffic, 0.6)) * noise)
+            km_step = speed * dt / 60.0
+            t = np.where(active, t + dt, t)
+
+            d1 = active & (phase == 0)
+            d2 = active & (phase == 2)
+            rem1 = np.where(d1, rem1 - km_step, rem1)
+            rem2 = np.where(d2, rem2 - km_step, rem2)
+            hold = np.where(active & ((phase == 1) | (phase == 3)), hold - dt, hold)
+
+            # Phase changes. Time not used in the step where a phase ends is handed back.
+            end0 = d1 & (rem1 <= 0)
+            t = np.where(end0, t + rem1 / speed * 60.0, t)
+            phase = np.where(end0, 1, phase)
+            hold = np.where(end0, PICKUP_HANDLING_SEC / 60, hold)
+
+            end1 = active & (phase == 1) & ~end0 & (hold <= 0)
+            t = np.where(end1, t + hold, t)
+            phase = np.where(end1, 2, phase)
+
+            end2 = d2 & (rem2 <= 0)
+            t = np.where(end2, t + rem2 / speed * 60.0, t)
+            phase = np.where(end2, 3, phase)
+            hold = np.where(end2, extra_handling, hold)
+
+            end3 = active & (phase == 3) & ~end2 & (hold <= 0)
+            t = np.where(end3, t + hold, t)
+            phase = np.where(end3, 4, phase)
+            # No further stops to handle: done as soon as the customer is reached
+            done_now = end2 & (extra_handling <= 0)
+            phase = np.where(done_now, 4, phase)
+
+        duration = np.maximum(t, 1.0)
+        # The congestion the trip really met, by inverting  minutes = km / (speed / congestion) * 60 + handling
+        congestion_met = (duration - handling_minutes(n_stops)) * free_flow / (60.0 * est_km)
+        return pd.DataFrame({
+            "distance_km": est_km,
+            "free_flow_speed_kmh": free_flow,
+            "n_stops": n_stops,
+            "traffic_factor": traffic_now,
+            "traffic_ahead": traffic_ahead,
+            "hour_of_day": start_hour,
+            "window_hours": window_hours,
+            "duration_minutes": duration,
+            "congestion_met": np.clip(congestion_met, 0.3, 5.0),
+        })
+
+    def _congestion_to_minutes(self, df: pd.DataFrame, congestion) -> np.ndarray:
+        return formula_eta_minutes(df["distance_km"].to_numpy(), df["free_flow_speed_kmh"].to_numpy(),
+                                   np.clip(congestion, 0.5, 4.0), df["n_stops"].to_numpy())
 
     def train(self) -> Dict[str, float]:
         logger.info("Training ETA prediction model")
         df = self._generate_training_data()
 
-        X = df[self.feature_names]
-        y = df["duration_minutes"]
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+        train_idx, test_idx = train_test_split(np.arange(len(df)), test_size=0.2, random_state=42)
+        train_df, test_df = df.iloc[train_idx], df.iloc[test_idx]
 
         if XGBOOST_AVAILABLE:
             self.model = xgb.XGBRegressor(
                 n_estimators=250,
-                max_depth=5,
-                learning_rate=0.08,
+                max_depth=4,
+                learning_rate=0.06,
+                min_child_weight=5,
                 subsample=0.8,
-                colsample_bytree=0.8,
+                colsample_bytree=1.0,
                 monotone_constraints=self.monotone_constraints,
+                n_jobs=4,                      # small data: more threads only add overhead
                 random_state=42,
                 verbosity=0,
             )
@@ -139,42 +236,64 @@ class ETAPredictor:
             from sklearn.ensemble import GradientBoostingRegressor
             self.model = GradientBoostingRegressor(n_estimators=150, max_depth=4, random_state=42)
 
-        self.model.fit(X_train, y_train)
-        preds = self.model.predict(X_test)
+        self.model.fit(train_df[self.feature_names], train_df["congestion_met"])
 
-        self.mae = float(mean_absolute_error(y_test, preds))
-        self.rmse = float(np.sqrt(np.mean((preds - y_test) ** 2)))
+        # Score on trips the model never saw: predicted congestion -> minutes, against the real time
+        actual = test_df["duration_minutes"].to_numpy()
+        preds = self._congestion_to_minutes(test_df, self.model.predict(test_df[self.feature_names]))
+
+        self.mae = float(mean_absolute_error(actual, preds))
+        self.rmse = float(np.sqrt(np.mean((preds - actual) ** 2)))
         self.is_trained = True
 
+        # The same unseen trips, estimated the two simple ways the ML model has to beat.
+        formula = formula_eta_minutes(test_df["distance_km"].to_numpy(), test_df["free_flow_speed_kmh"].to_numpy(),
+                                      test_df["traffic_factor"].to_numpy(), test_df["n_stops"].to_numpy())
+        fixed = fixed_speed_eta_minutes(test_df["distance_km"].to_numpy(), test_df["n_stops"].to_numpy())
+        self.evaluation = {
+            "samples": int(len(actual)),
+            "methods": {
+                "ml": error_stats(actual, preds),
+                "formula": error_stats(actual, formula),
+                "fixed_speed": error_stats(actual, fixed),
+            },
+        }
+
         metrics = {"mae_minutes": round(self.mae, 2), "rmse_minutes": round(self.rmse, 2)}
-        logger.info("ETA model trained", **metrics)
+        logger.info("ETA model trained", **metrics, formula_mae=self.evaluation["methods"]["formula"]["mae"])
         return metrics
 
     def predict(
         self,
         distance_km: float,
         speed_kmh: float,
-        hour: int,
-        day_of_week: int,
+        hour: float,
+        day_of_week: int = 0,
         n_stops: int = 1,
         vehicle_type_enc: int = 0,
         traffic_factor: float = 1.0,
         weight_kg_norm: float = 0.5,
+        sim_speed: float = 1.0,
+        region: str = MUMBAI,
     ) -> Tuple[float, float]:
         """
         Returns (predicted_minutes, confidence_pct).
-        `speed_kmh` is the vehicle's free-flow speed; congestion goes in `traffic_factor`.
+        `speed_kmh` is the vehicle's free-flow speed; congestion right now goes in `traffic_factor`.
+        `hour` is IST time as a fraction (10.5 = 10:30). `day_of_week`, `vehicle_type_enc` and
+        `weight_kg_norm` are accepted for API compatibility but do not change travel time in the
+        simulated world, so the model ignores them.
         """
         if not self.is_trained or self.model is None:
-            # Fallback deterministic estimate
-            base = (distance_km / max(speed_kmh, 5.0)) * 60 * traffic_factor + n_stops * 8
-            return round(base, 1), 70.0
+            # Not trained yet: fall back to the simple formula
+            return round(formula_eta_minutes(distance_km, speed_kmh, traffic_factor, n_stops), 1), 70.0
 
+        ridx = region_index(region)
+        window = trip_window_hours(ridx, hour, distance_km, speed_kmh, n_stops, max(sim_speed, 0.1))
         features = pd.DataFrame([[
-            distance_km, speed_kmh, hour, day_of_week,
-            n_stops, vehicle_type_enc, traffic_factor, weight_kg_norm,
+            traffic_factor, typical_traffic_ahead(ridx, hour, window), hour, window,
         ]], columns=self.feature_names)
-        pred = float(self.model.predict(features)[0])
+        congestion = float(np.clip(self.model.predict(features)[0], 0.5, 4.0))
+        pred = formula_eta_minutes(distance_km, speed_kmh, congestion, n_stops)
         # Confidence based on training MAE relative to prediction
         confidence = max(50.0, min(98.0, 100 - (self.mae / max(pred, 1)) * 50))
         return round(max(pred, 1.0), 1), round(confidence, 1)
@@ -430,7 +549,7 @@ class MLEngine:
                 "eta_prediction": {
                     "ready": self.eta_predictor.is_trained,
                     "metrics": self.training_metrics.get("eta", {}),
-                    "description": "XGBoost regression — predicts delivery duration from route features",
+                    "description": "XGBoost - quotes the ETA of every order the dispatcher assigns, learning from the simple distance/speed formula where traffic is about to change",
                 },
                 "demand_forecast": {
                     "ready": self.demand_forecaster.is_trained,

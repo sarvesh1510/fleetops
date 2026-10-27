@@ -1,10 +1,10 @@
 import { useEffect, useMemo, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { keepPreviousData } from '@tanstack/react-query'
-import { Brain, Info, Clock3, TrendingUp, AlertTriangle } from 'lucide-react'
+import { Brain, Info, Clock3, TrendingUp, AlertTriangle, Target } from 'lucide-react'
 import {
   BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, CartesianGrid,
-  LineChart, Line, ReferenceDot, Cell,
+  LineChart, Line, ReferenceDot, Cell, ScatterChart, Scatter, ReferenceLine, Legend,
 } from 'recharts'
 import { mlApi, ApiError } from '../services/api'
 import {
@@ -12,7 +12,7 @@ import {
 } from '../components/ui'
 import { CHART, axisTick, tooltipStyle, tooltipLabelStyle, tooltipItemStyle } from '../components/analytics/ChartKit'
 import { formatMinutes, formatNumber, formatDateTime, formatPct } from '../lib/utils'
-import type { MLStatus, MLModelStatus, EtaPrediction, DemandForecast } from '../types'
+import type { MLStatus, MLModelStatus, EtaPrediction, DemandForecast, EtaEvaluation, EtaErrors, EtaMethod } from '../types'
 
 // A 503 means the model is still training; we retry those automatically.
 function isTraining(err: unknown): boolean {
@@ -101,6 +101,141 @@ function ModelStatusGrid() {
     <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
       {order.map(k => <ModelCard key={k} keyName={k} model={data.models[k]} trainedAt={data.trained_at} />)}
     </div>
+  )
+}
+
+// ── ETA accuracy: ML model vs simple formulas ─────────────────────────────────────
+const METHOD_META: Record<EtaMethod, { label: string; hint: string; color: string }> = {
+  ml: { label: 'ML model', hint: 'Predicts the traffic the trip will meet, e.g. rush hour starting mid-trip', color: CHART.brand },
+  formula: { label: 'Simple formula', hint: 'Distance ÷ speed in current traffic + handling time (what the app used before)', color: '#94a3b8' },
+  fixed_speed: { label: 'Fixed-speed guess', hint: 'Distance ÷ 25 km/h + handling time, ignoring traffic', color: '#cbd5e1' },
+}
+const METHOD_ORDER: EtaMethod[] = ['ml', 'formula', 'fixed_speed']
+
+function ErrorBars({ title, subtitle, methods }: { title: string; subtitle: string; methods: EtaErrors | null }) {
+  const max = methods ? Math.max(...METHOD_ORDER.map(m => methods[m].mae), 0.1) : 1
+  return (
+    <div className="rounded-xl border border-line p-4">
+      <div className="text-[13px] font-bold text-ink">{title}</div>
+      <p className="mb-3 text-[11px] text-ink-3">{subtitle}</p>
+      {methods ? (
+        <ul className="space-y-3">
+          {METHOD_ORDER.map(m => (
+            <li key={m}>
+              <div className="mb-1 flex items-baseline justify-between gap-2">
+                <span className="text-xs font-semibold text-ink" title={METHOD_META[m].hint}>{METHOD_META[m].label}</span>
+                <span className="font-mono text-[13px] font-semibold text-ink">{formatNumber(methods[m].mae, 1)} min</span>
+              </div>
+              <div className="h-2.5 w-full overflow-hidden rounded-full bg-subtle" role="img"
+                aria-label={`${METHOD_META[m].label}: average error ${formatNumber(methods[m].mae, 1)} minutes`}>
+                <div className="h-full rounded-full"
+                  style={{ width: `${Math.max(2, (methods[m].mae / max) * 100)}%`, background: METHOD_META[m].color }} />
+              </div>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-xs text-ink-3">Nothing to show yet.</p>
+      )}
+    </div>
+  )
+}
+
+function useEtaEvaluation() {
+  return useQuery<EtaEvaluation>({
+    queryKey: ['ml-eta-evaluation'],
+    queryFn: () => mlApi.etaEvaluation(),
+    refetchInterval: 15_000,
+  })
+}
+
+function EtaAccuracy() {
+  const { data, isLoading, isError, error, refetch } = useEtaEvaluation()
+
+  let summary: string | null = null
+  const held = data?.held_out
+  if (held && held.ml_vs_formula_pct != null) {
+    summary = `On ${formatNumber(held.samples, 0)} unseen test trips the ML model is off by ${formatNumber(held.methods.ml.mae, 1)} min on average, `
+      + `the simple formula by ${formatNumber(held.methods.formula.mae, 1)} min `
+      + `(${formatNumber(Math.abs(held.ml_vs_formula_pct), 0)}% ${held.ml_vs_formula_pct >= 0 ? 'lower' : 'higher'} for ML).`
+  }
+
+  return (
+    <Section title="How accurate is the ETA model?"
+      subtitle="Average error in minutes (lower is better). Every order the dispatcher assigns gets its ETA from the ML model.">
+      {isLoading ? (
+        <Skeleton className="h-[160px] w-full" />
+      ) : isError || !data ? (
+        <ErrorState message={(error as Error | undefined)?.message} onRetry={() => refetch()} />
+      ) : !data.model_ready ? (
+        <EmptyState icon={Clock3} title="Model is still training"
+          hint="Orders assigned until now use the simple formula. This updates automatically." />
+      ) : (
+        <div className="space-y-3">
+          {summary && <p className="text-[13px] leading-relaxed text-ink-2">{summary}</p>}
+          <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+            <ErrorBars title="Test trips (simulated history)"
+              subtitle="Trips set aside before training, so the model has never seen them."
+              methods={held?.methods ?? null} />
+            <ErrorBars title={`Live deliveries (${data.live.samples})`}
+              subtitle={data.live.samples
+                ? 'Estimates made when each order was assigned vs how long it really took in this simulation.'
+                : 'No order has been delivered since the ML model went live. Speed the simulation up to collect some.'}
+              methods={data.live.methods} />
+          </div>
+          <ul className="grid grid-cols-1 gap-1 text-[11px] text-ink-3 md:grid-cols-3">
+            {METHOD_ORDER.map(m => (
+              <li key={m}><span className="font-semibold text-ink-2">{METHOD_META[m].label}:</span> {METHOD_META[m].hint}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+    </Section>
+  )
+}
+
+// ── Predicted vs actual ───────────────────────────────────────────────────────────────
+function PredictedVsActual() {
+  const { data, isLoading, isError, error, refetch } = useEtaEvaluation()
+  const points = data?.live.points ?? []
+  const top = Math.ceil(Math.max(10, ...points.flatMap(p => [p.ml_min, p.formula_min, p.actual_min])) / 10) * 10
+
+  return (
+    <Section title="Predicted vs actual delivery time"
+      subtitle="Each dot is a delivered order. The closer a dot is to the dashed line, the better the estimate.">
+      {isLoading ? (
+        <Skeleton className="h-[300px] w-full" />
+      ) : isError || !data ? (
+        <ErrorState message={(error as Error | undefined)?.message} onRetry={() => refetch()} />
+      ) : points.length === 0 ? (
+        <EmptyState icon={Target} title="No deliveries to compare yet"
+          hint="Orders delivered after the ML model came online appear here. Use Simulation → 10x to see results sooner." />
+      ) : (
+        <>
+          <ResponsiveContainer width="100%" height={320}>
+            <ScatterChart margin={{ top: 8, right: 16, left: 0, bottom: 20 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke={CHART.grid} />
+              <XAxis type="number" dataKey="predicted" name="Predicted" domain={[0, top]} tick={axisTick} tickLine={false}
+                axisLine={{ stroke: CHART.grid }} label={{ value: 'Predicted (min)', position: 'insideBottom', offset: -10, style: axisTick }} />
+              <YAxis type="number" dataKey="actual" name="Actual" domain={[0, top]} tick={axisTick} tickLine={false} axisLine={false}
+                label={{ value: 'Actual (min)', angle: -90, position: 'insideLeft', style: axisTick }} />
+              <Tooltip contentStyle={tooltipStyle} labelStyle={tooltipLabelStyle} itemStyle={tooltipItemStyle}
+                cursor={{ strokeDasharray: '3 3' }}
+                formatter={(v) => `${formatNumber(Number(v), 1)} min`} />
+              <Legend verticalAlign="top" height={28} iconType="circle" wrapperStyle={{ fontSize: 12 }} />
+              <ReferenceLine segment={[{ x: 0, y: 0 }, { x: top, y: top }]} stroke={CHART.warn} strokeDasharray="5 4" />
+              <Scatter name="Simple formula" fill="#94a3b8" fillOpacity={0.75}
+                data={points.map(p => ({ predicted: p.formula_min, actual: p.actual_min }))} />
+              <Scatter name="ML model" fill={CHART.brand} fillOpacity={0.85}
+                data={points.map(p => ({ predicted: p.ml_min, actual: p.actual_min }))} />
+            </ScatterChart>
+          </ResponsiveContainer>
+          <p className="mt-1 text-[11px] text-ink-3">
+            Last {points.length} delivered orders. Actual time runs from assignment (driving to pickup) to delivery, in simulated minutes.
+          </p>
+        </>
+      )}
+    </Section>
   )
 }
 
@@ -317,12 +452,15 @@ export default function PredictionsPage() {
           <div className="flex items-start gap-2 rounded-lg border border-line bg-brand-soft px-4 py-3 text-xs text-ink-2" role="note">
             <Info size={15} className="mt-0.5 flex-shrink-0 text-brand" />
             <p>
-              These models are trained on <span className="font-semibold text-ink">synthetic data</span> modelled on Mumbai and Delhi
-              delivery patterns. The metrics below describe accuracy within that synthetic world, not real-world performance.
+              These models are trained on <span className="font-semibold text-ink">synthetic data</span> generated with this
+              simulation's own rules (speeds, rush hours, stop times). The accuracy figures describe how well they learned that
+              simulated world, not real-world performance.
             </p>
           </div>
 
           <ModelStatusGrid />
+          <EtaAccuracy />
+          <PredictedVsActual />
           <EtaEstimator />
           <DemandForecastChart />
         </div>

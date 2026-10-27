@@ -27,6 +27,7 @@ import structlog
 from pymongo import UpdateOne
 
 from app.config import settings
+from app.ml.models import ml_engine
 from app.models.incident import (
     AutonomousAction, Incident, IncidentSeverity, IncidentStatus,
     IncidentTimelineEntry, IncidentType,
@@ -34,10 +35,15 @@ from app.models.incident import (
 from app.models.optimization import OptimizationTrigger
 from app.models.order import AddressPoint, Order, OrderPriority, OrderStatus
 from app.models.vehicle import GeoPoint, Vehicle, VehicleStatus
+from app.simulation.profile import (
+    BASE_SPEED_KMH, DELIVERY_HANDLING_SEC, PICKUP_HANDLING_SEC, ROAD_CIRCUITY,
+    SURGE_DURATION_SEC, TYPE_SPEED_FACTOR, fixed_speed_eta_minutes,
+    formula_eta_minutes, free_flow_speed_kmh, target_traffic,
+)
 from app.simulation.routing import road_router
 from app.utils.cargo import random_cargo_weight
 from app.utils.geo import (  # re-exported for callers/tests
-    DELHI, MUMBAI, REGIONS, bearing, haversine_km, ist_hour, region_for_lng,
+    DELHI, MUMBAI, REGIONS, bearing, haversine_km, ist_hour, ist_now, region_for_lng,
 )
 from app.websocket.broadcaster import WSEventType, broadcaster
 
@@ -101,26 +107,16 @@ INDIAN_COMPANIES = [
 ]
 
 # ── Tunables (simulated seconds unless noted) ─────────────────────────────────
-PICKUP_HANDLING_SEC = 240
-DELIVERY_HANDLING_SEC = 180
+# Speeds, traffic by hour and handling times live in simulation/profile.py so the ETA
+# model is trained on exactly the same rules the vehicles follow here.
 REFUEL_SEC = 180
 LOW_FUEL_PCT = 15.0           # idle vehicles below this go to refuel
 CRITICAL_FUEL_PCT = 8.0       # en-route vehicles below this raise an incident
 BREAKDOWN_RATE_PER_TICK = 0.00004
-SURGE_DURATION_SEC = 1200
 ORDER_GEN_EVERY_TICKS = 10
 ORDER_GEN_PROBABILITY = 0.25   # ~0.75 new orders/min at 1x: keeps a 78-vehicle fleet around half busy
 DISPATCH_EVERY_TICKS = 3
 PERSIST_VEHICLES_EVERY_TICKS = 15
-
-# Typical free-flow city speed (km/h) by region and by vehicle type.
-BASE_SPEED_KMH = {MUMBAI: 24.0, DELHI: 30.0}
-# Road distance is longer than the straight line; used for ETAs before/without a real route.
-ROAD_CIRCUITY = 1.3
-
-TYPE_SPEED_FACTOR = {
-    "van": 1.0, "truck": 0.85, "cargo_bike": 1.15, "motorcycle": 1.3, "refrigerated": 0.95,
-}
 
 # Energy use in % of tank/battery per km.
 def fuel_use_pct_per_km(fuel_type: str, vehicle_type: str) -> float:
@@ -440,15 +436,7 @@ class SimulationEngine:
 
     # ── Traffic ───────────────────────────────────────────────────────────────
     def _target_traffic(self, region: str) -> float:
-        hour = ist_hour(datetime.utcnow())
-        peak = 1.9 if region == MUMBAI else 1.7
-        if 8 <= hour <= 11 or 17 <= hour <= 20:
-            return peak
-        if 13 <= hour <= 15:
-            return 1.3
-        if hour < 7 or hour > 22:
-            return 0.85
-        return 1.15
+        return target_traffic(region, ist_hour(datetime.utcnow()))
 
     async def _update_traffic(self):
         for region in REGIONS:
@@ -715,14 +703,48 @@ class SimulationEngine:
         """Straight-line to road-distance multiplier (1.0 when vehicles move in straight lines)."""
         return ROAD_CIRCUITY if road_router.enabled else 1.0
 
-    def estimate_order_minutes(self, vehicle: Vehicle, order: Order) -> float:
-        """Total minutes from now to delivery if `vehicle` took `order` (drive + handling)."""
-        speed = self.expected_speed_kmh(vehicle)
+    def _order_road_km(self, vehicle: Vehicle, order: Order) -> float:
+        """Estimated road distance: vehicle -> pickup -> delivery."""
         plat, plng = order.pickup.location.coordinates[1], order.pickup.location.coordinates[0]
         dlat, dlng = order.delivery.location.coordinates[1], order.delivery.location.coordinates[0]
-        d = (haversine_km(vehicle.location.coordinates[1], vehicle.location.coordinates[0], plat, plng)
-             + haversine_km(plat, plng, dlat, dlng)) * self._road_factor()
-        return d / speed * 60 + (PICKUP_HANDLING_SEC + DELIVERY_HANDLING_SEC) / 60
+        return (haversine_km(vehicle.location.coordinates[1], vehicle.location.coordinates[0], plat, plng)
+                + haversine_km(plat, plng, dlat, dlng)) * self._road_factor()
+
+    def estimate_order_eta(self, vehicle: Vehicle, order: Order) -> dict:
+        """
+        Quote the ETA for giving `order` to `vehicle`.
+
+        Returns the figure to use (`used`, from the ML model once it has trained, otherwise the
+        simple formula) plus all three estimates, so each can later be scored against the real
+        delivery time.
+        """
+        region = vehicle.region or region_for_lng(vehicle.location.coordinates[0])
+        km = self._order_road_km(vehicle, order)
+        traffic = self.traffic_factor(region)
+        free_flow = free_flow_speed_kmh(region, vehicle.type.value)
+        formula = formula_eta_minutes(km, free_flow, traffic, n_stops=2)
+        fixed = fixed_speed_eta_minutes(km, n_stops=2)
+
+        ml: Optional[float] = None
+        eta_model = ml_engine.eta_predictor
+        if eta_model.is_trained:
+            try:
+                now = ist_now()
+                ml, _ = eta_model.predict(
+                    distance_km=km, speed_kmh=free_flow,
+                    hour=now.hour + now.minute / 60.0, n_stops=2,
+                    traffic_factor=traffic, sim_speed=self.speed, region=region,
+                )
+            except Exception:
+                logger.warning("ML ETA failed, using the simple formula", exc_info=True)
+                ml = None
+        return {
+            "used": ml if ml is not None else formula,
+            "source": "ml" if ml is not None else "formula",
+            "ml": ml,
+            "formula": formula,
+            "fixed_speed": fixed,
+        }
 
     def _remaining_eta_min(self, state: VehicleSimState) -> Optional[float]:
         order = state.current_order
@@ -796,8 +818,13 @@ class SimulationEngine:
         order.assigned_driver_id = v.driver_id
         order.assigned_at = now
         order.region = order.region or state.region
-        eta = self.estimate_order_minutes(v, order)
+        eta_info = self.estimate_order_eta(v, order)
+        eta = eta_info["used"]
         order.predicted_eta_minutes = round(eta, 1)
+        order.eta_source = eta_info["source"]
+        order.ml_eta_minutes = round(eta_info["ml"], 1) if eta_info["ml"] is not None else None
+        order.formula_eta_minutes = round(eta_info["formula"], 1)
+        order.fixed_speed_eta_minutes = round(eta_info["fixed_speed"], 1)
         order.eta_minutes = round(eta, 1)
         order.estimated_delivery_at = now + timedelta(minutes=eta / max(self.speed, 0.1))
 

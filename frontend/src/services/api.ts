@@ -4,7 +4,7 @@
  */
 import type {
   AnalyticsOverview, CreateOrderPayload, CreateOrderResponse, DemandForecast, EtaPerformancePoint,
-  EtaPrediction, FleetStats, HourlyDeliveries, Incident, IncidentList, IncidentStats, MLStatus,
+  EtaEvaluation, EtaPrediction, FleetStats, HourlyDeliveries, Incident, IncidentList, IncidentStats, MLStatus,
   OptimizationRun, OptimizationStats, Order, OrderStats, Paginated, Region, SimulationStatus,
   Vehicle, VehicleDetail,
 } from '../types'
@@ -136,6 +136,7 @@ export const mlApi = {
   predictEta: (p: { distance_km: number; speed_kmh: number; n_stops: number; traffic_factor: number }) =>
     post<EtaPrediction>(`/predictions/eta${qs(p)}`),
   demand: () => get<DemandForecast>('/predictions/demand'),
+  etaEvaluation: () => get<EtaEvaluation>('/predictions/eta-evaluation'),
 }
 
 // ── Simulation ─────────────────────────────────────────────────────────────────

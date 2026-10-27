@@ -456,13 +456,12 @@ class TestSimulationEngine:
 
 class TestMLModels:
     @pytest.fixture(autouse=True)
-    def train_models(self):
-        """Train all models before tests (uses small dataset, fast)."""
-        from app.ml.models import ETAPredictor, DemandForecaster, AnomalyDetector
-        self.eta = ETAPredictor()
+    def train_models(self, trained_eta):
+        """Train the cheap models per test; the ETA model is trained once for the whole run."""
+        from app.ml.models import DemandForecaster, AnomalyDetector
+        self.eta = trained_eta
         self.demand = DemandForecaster()
         self.anomaly = AnomalyDetector()
-        self.eta.train()
         self.demand.train()
         self.anomaly.train()
 
@@ -515,6 +514,50 @@ class TestMLModels:
         assert self.eta.rmse is not None
         assert self.eta.mae < 30   # MAE under 30 minutes
         assert self.eta.rmse < 50  # RMSE under 50 minutes
+
+    def test_eta_never_shorter_with_more_traffic(self):
+        """The estimator's traffic slider must never make the ETA drop (checked across contexts)."""
+        for hour in (3.0, 8.5, 12.0, 18.25):
+            for distance in (3.0, 15.0, 40.0):
+                for speed in (20.0, 35.0, 50.0):
+                    etas = [self.eta.predict(distance_km=distance, speed_kmh=speed, hour=hour,
+                                             day_of_week=2, n_stops=2, traffic_factor=tf)[0]
+                            for tf in (0.8, 1.0, 1.3, 1.7, 2.1, 2.6)]
+                    assert etas == sorted(etas), f"ETA dropped as traffic rose: {etas}"
+
+    def test_eta_longer_for_more_distance_and_stops(self):
+        short, _ = self.eta.predict(distance_km=5, speed_kmh=30, hour=11, day_of_week=1, n_stops=2, traffic_factor=1.2)
+        long, _ = self.eta.predict(distance_km=25, speed_kmh=30, hour=11, day_of_week=1, n_stops=2, traffic_factor=1.2)
+        many, _ = self.eta.predict(distance_km=5, speed_kmh=30, hour=11, day_of_week=1, n_stops=6, traffic_factor=1.2)
+        assert long > short and many > short
+
+    def test_eta_sees_rush_hour_coming(self):
+        """
+        A 15 km trip starting at 07:40 runs into the 08:00 rush; the same trip at noon does not,
+        although traffic *right now* is identical. The simple formula cannot tell the two apart.
+        """
+        from app.simulation.profile import formula_eta_minutes
+        kw = dict(distance_km=15.0, speed_kmh=24.0, day_of_week=1, n_stops=2, traffic_factor=1.15)
+        early, _ = self.eta.predict(hour=7 + 40 / 60, **kw)
+        noon, _ = self.eta.predict(hour=12.0, **kw)
+        assert early > noon * 1.08
+        assert noon == pytest.approx(formula_eta_minutes(15.0, 24.0, 1.15, 2), rel=0.15)
+
+    def test_eta_beats_both_simple_estimates_on_held_out_trips(self):
+        ev = self.eta.evaluation
+        assert ev is not None and ev["samples"] > 500
+        ml, formula, fixed = (ev["methods"][k]["mae"] for k in ("ml", "formula", "fixed_speed"))
+        assert ml < formula < fixed
+        assert ml == pytest.approx(self.eta.mae, abs=0.01)
+
+    def test_untrained_eta_model_falls_back_to_the_simple_formula(self):
+        from app.ml.models import ETAPredictor
+        from app.simulation.profile import formula_eta_minutes
+        fresh = ETAPredictor()
+        minutes, confidence = fresh.predict(distance_km=10, speed_kmh=28, hour=9.5, day_of_week=1,
+                                            n_stops=2, traffic_factor=1.4)
+        assert minutes == pytest.approx(formula_eta_minutes(10, 28, 1.4, 2), abs=0.06)
+        assert confidence == 70.0
 
     def test_demand_metrics_reasonable(self):
         assert self.demand.mae is not None

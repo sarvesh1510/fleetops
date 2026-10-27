@@ -137,6 +137,8 @@ export interface Order {
   deadline: string | null
   eta_minutes: number | null
   predicted_eta_minutes: number | null
+  /** Which estimate was quoted at assignment: the ML model, or the simple formula before it was trained */
+  eta_source?: 'ml' | 'formula' | null
   actual_duration_min: number | null
   sla_at_risk: boolean
   reassignment_count: number
@@ -480,3 +482,26 @@ export interface LiveEvent {
   vehicle_id?: string
   order_id?: string
 }
+export type EtaMethod = 'ml' | 'formula' | 'fixed_speed'
+export type EtaErrors = Record<EtaMethod, { mae: number; rmse: number }>
+
+export interface EtaEvaluation {
+  model_ready: boolean
+  /** Unseen synthetic trips set aside before training; null while the model trains */
+  held_out: {
+    samples: number
+    methods: EtaErrors
+    /** Positive = the ML model's mean error is that much lower */
+    ml_vs_formula_pct: number | null
+    ml_vs_fixed_speed_pct: number | null
+  } | null
+  /** Orders delivered in the simulation, scored against the estimates made at assignment */
+  live: {
+    samples: number
+    methods: EtaErrors | null
+    ml_vs_formula_pct: number | null
+    ml_vs_fixed_speed_pct: number | null
+    points: { order_ref: string; ml_min: number; formula_min: number; actual_min: number; delivered_at: string | null }[]
+  }
+}
+

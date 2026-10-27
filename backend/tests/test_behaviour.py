@@ -304,3 +304,89 @@ class TestMLBehaviour:
         by_zone = {f["zone"]: f["predicted_orders"] for f in demand.predict_all_zones(10, 2)}
         assert by_zone["Andheri"] > by_zone["Faridabad"] * 1.5
         assert len(set(by_zone.values())) > 5
+
+
+# ── ETA quote at assignment ───────────────────────────────────────────────────
+
+class TestEtaQuote:
+    @pytest.mark.asyncio
+    async def test_assignment_uses_formula_until_ml_model_is_trained(self, quiet_sim, monkeypatch):
+        from app.ml.models import ETAPredictor
+        monkeypatch.setattr("app.simulation.engine.ml_engine.eta_predictor", ETAPredictor())  # untrained
+        wire(quiet_sim)
+        quiet_sim.load_vehicles([make_vehicle("v1", 19.0)])
+        order = make_order("job", 19.0 + km_to_lat(1), dlat=19.0 + km_to_lat(6))
+        await quiet_sim.add_order(order)
+        assert order.eta_source == "formula"
+        assert order.ml_eta_minutes is None
+        assert order.predicted_eta_minutes == order.formula_eta_minutes
+        assert order.fixed_speed_eta_minutes > 0
+
+    @pytest.mark.asyncio
+    async def test_assignment_quotes_ml_eta_and_keeps_all_three_estimates(self, quiet_sim, monkeypatch, trained_eta):
+        monkeypatch.setattr("app.simulation.engine.ml_engine.eta_predictor", trained_eta)
+        wire(quiet_sim)
+        quiet_sim.load_vehicles([make_vehicle("v1", 19.0)])
+        order = make_order("job", 19.0 + km_to_lat(1), dlat=19.0 + km_to_lat(6))
+        await quiet_sim.add_order(order)
+        assert order.eta_source == "ml"
+        assert order.ml_eta_minutes and order.formula_eta_minutes and order.fixed_speed_eta_minutes
+        assert order.predicted_eta_minutes == order.ml_eta_minutes
+        assert order.eta_minutes == order.ml_eta_minutes
+
+    @pytest.mark.asyncio
+    async def test_delivered_order_keeps_quote_next_to_actual_time(self, quiet_sim, monkeypatch, trained_eta):
+        monkeypatch.setattr("app.simulation.engine.ml_engine.eta_predictor", trained_eta)
+        wire(quiet_sim)
+        quiet_sim.load_vehicles([make_vehicle("v1", 19.0)])
+        order = make_order("job", 19.0 + km_to_lat(0.5), dlat=19.0 + km_to_lat(2.0))
+        await quiet_sim.add_order(order)
+        quoted = order.ml_eta_minutes
+        for _ in range(60):
+            await quiet_sim._tick()
+            if order.status == OrderStatus.DELIVERED:
+                break
+        assert order.status == OrderStatus.DELIVERED
+        assert order.ml_eta_minutes == quoted
+        assert order.actual_duration_min > 0
+
+    @pytest.mark.asyncio
+    async def test_eta_evaluation_endpoint_scores_each_method_against_actual(self, monkeypatch, trained_eta):
+        from app.routers import optimization as router
+
+        monkeypatch.setattr(router.ml_engine, "eta_predictor", trained_eta)
+        rows = [
+            {"reference": "A", "ml_eta_minutes": 50.0, "formula_eta_minutes": 40.0,
+             "fixed_speed_eta_minutes": 30.0, "actual_duration_min": 50.0, "delivered_at": datetime.utcnow()},
+            {"reference": "B", "ml_eta_minutes": 62.0, "formula_eta_minutes": 50.0,
+             "fixed_speed_eta_minutes": 80.0, "actual_duration_min": 60.0, "delivered_at": datetime.utcnow()},
+        ]
+        cursor = MagicMock()
+        cursor.sort.return_value.limit.return_value.to_list = AsyncMock(return_value=list(reversed(rows)))
+        db = MagicMock()
+        db.orders.find = MagicMock(return_value=cursor)
+
+        out = await router.eta_evaluation(limit=50, current_user={}, db=db)
+
+        assert out["model_ready"] is True
+        assert out["held_out"]["samples"] > 500
+        assert out["held_out"]["ml_vs_formula_pct"] > 0
+        live = out["live"]
+        assert live["samples"] == 2
+        assert live["methods"]["ml"]["mae"] == pytest.approx(1.0)          # |0| and |2|
+        assert live["methods"]["formula"]["mae"] == pytest.approx(10.0)    # |10| and |10|
+        assert live["methods"]["fixed_speed"]["mae"] == pytest.approx(20.0)  # |20| and |20|
+        assert live["ml_vs_formula_pct"] == pytest.approx(90.0)
+        assert [p["order_ref"] for p in live["points"]] == ["A", "B"]      # oldest first
+
+    @pytest.mark.asyncio
+    async def test_eta_evaluation_with_no_deliveries_reports_empty_live_section(self, monkeypatch, trained_eta):
+        from app.routers import optimization as router
+
+        monkeypatch.setattr(router.ml_engine, "eta_predictor", trained_eta)
+        cursor = MagicMock()
+        cursor.sort.return_value.limit.return_value.to_list = AsyncMock(return_value=[])
+        db = MagicMock()
+        db.orders.find = MagicMock(return_value=cursor)
+        out = await router.eta_evaluation(limit=50, current_user={}, db=db)
+        assert out["live"]["samples"] == 0 and out["live"]["methods"] is None and out["live"]["points"] == []

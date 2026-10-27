@@ -17,7 +17,7 @@ Everything is simulated: vehicles, telemetry, orders and incidents are generated
 | **Incidents** | A breakdown creates an incident with a timeline, reassigns the vehicle's active order through the dispatcher, and can be resolved with notes. Traffic surges create (and later expire) regional incidents. |
 | **Orders** | Create orders (cross-region and out-of-region coordinates are rejected), follow status transitions, see assignment and ETA. |
 | **Analytics** | On-time rate, ETA accuracy, delivery volume per hour (IST), cost per delivery. Values are computed from delivered orders; where there is no data yet they are shown as empty, not invented. |
-| **Predictions** | ETA estimator (XGBoost), demand forecast per zone/hour, telemetry anomaly check (Isolation Forest). |
+| **Predictions** | The ETA model quotes the ETA of every assigned order; the page compares it with simple formulas on held-out trips and on real simulated deliveries (predicted vs actual). Also a what-if ETA estimator, demand forecast per zone/hour, telemetry anomaly check (Isolation Forest). |
 | **Auth** | JWT + bcrypt, four roles: Admin, Ops Manager, Dispatcher, Viewer. WebSocket requires the token (`?token=`). |
 
 ---
@@ -107,11 +107,15 @@ It is a one-to-one assignment solver, not a multi-stop route optimiser (no VRP).
 
 | Model | Algorithm | Notes |
 |---|---|---|
-| ETA | XGBoost regressor with monotone constraints | Inputs: distance, free-flow speed, hour, day, stops, vehicle type, traffic, load. More traffic never lowers the estimate. The `speed_kmh` field of `/predictions/eta` is the free-flow speed. |
+| ETA | XGBoost regressor with monotone constraints, inside the ETA formula | The simple formula is `distance / (free-flow speed / congestion) + handling time`. Its weak spot is `congestion`: it uses the reading at assignment time. XGBoost predicts the congestion the trip will actually meet (e.g. rush hour starting mid-trip) from congestion now, typical congestion over the trip window, and the time of day; that prediction goes into the same formula. More traffic never lowers the estimate. Used for every order the dispatcher assigns. The `speed_kmh` field of `/predictions/eta` is the free-flow speed. |
 | Demand | Gradient boosting | Orders per zone per hour |
 | Anomaly | Isolation Forest | Speed, fuel rate, stop duration, route deviation, engine temperature |
 
 MAE/RMSE shown in the UI come from a held-out split of the synthetic data. Endpoints return `503` while the models are still training.
+
+**ETA model in the system.** When the dispatcher assigns an order, `SimulationEngine.estimate_order_eta` computes three estimates and stores them on the order: the ML model's (this is the quoted ETA once the model has trained), the simple formula's, and a fixed-speed guess (25 km/h, no traffic). When the order is delivered, the real elapsed time is stored next to them. `GET /predictions/eta-evaluation` scores all three against (a) held-out synthetic trips and (b) real delivered orders, and the Predictions page shows both, plus a predicted-vs-actual scatter. While driving, the live ETA countdown still uses the remaining road distance and current traffic.
+
+**Reading the results honestly.** The ETA model is trained on trips generated with the simulator's own rules (`backend/app/simulation/profile.py`), so it learns the simulated world, not real roads. Its gain over the simple formula comes from trips that cross a rush-hour boundary; in calm traffic the two are about equal. Manually triggered traffic surges are not modelled, so all estimates are off during one. The speed multiplier changes how much traffic shifts during a trip; the model takes it into account.
 
 ---
 
@@ -130,7 +134,8 @@ POST /optimization/run      GET  /optimization/runs   GET  /optimization/runs/{i
 
 GET  /analytics/overview    GET  /analytics/deliveries-per-hour    GET /analytics/eta-performance
 
-GET  /predictions/status    POST /predictions/eta     GET  /predictions/demand       POST /predictions/anomaly
+GET  /predictions/status    POST /predictions/eta     GET  /predictions/eta-evaluation
+GET  /predictions/demand    POST /predictions/anomaly
 
 GET  /simulation/status     POST /simulation/start|pause|resume|speed
 POST /simulation/trigger/traffic|breakdown|order
@@ -166,6 +171,7 @@ backend/app/
   routers/                auth, vehicles, orders, incidents, optimization/analytics/ml, simulation (+ WS)
   simulation/engine.py    Simulation loop (movement, breakdowns, traffic, refuel, order lifecycle)
   simulation/seeder.py    Users, fleet, historical orders
+  simulation/profile.py   Speeds, rush-hour traffic, handling times, baseline ETA formulas (shared by sim and ML)
   optimization/engine.py  Scoring, Hungarian assignment, baseline comparison
   ml/models.py            ETA / demand / anomaly models
   utils/geo.py            Haversine, region lookup, IST helpers
@@ -188,7 +194,7 @@ cd backend
 pytest tests/ -q
 ```
 
-50 tests: auth, models, scoring and assignment, simulation movement and lifecycle, ML training/prediction (including ETA monotonic in traffic), and behavioural checks (region-safe dispatch, breakdown reassignment, order validation, analytics from real data).
+76 tests: auth, models, scoring and assignment, simulation movement and lifecycle, ML training/prediction (ETA monotonic in traffic, ML beats the simple formula on held-out trips, ETA quote stored at assignment, evaluation endpoint), and behavioural checks (region-safe dispatch, breakdown reassignment, order validation, analytics from real data).
 
 Frontend: `cd frontend && npm run build` (type-check + production build) and `npm run lint`.
 

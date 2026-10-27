@@ -167,7 +167,7 @@ export default function OrderDrawer({ orderId, onClose }: { orderId: string; onC
               <section className="grid grid-cols-2 gap-3 border-t border-line pt-4">
                 {order.status === 'delivered' ? (
                   <>
-                    <KeyValue label="Predicted">{formatMinutes(order.predicted_eta_minutes)}</KeyValue>
+                    <KeyValue label={order.eta_source === 'ml' ? 'Predicted (ML)' : 'Predicted'}>{formatMinutes(order.predicted_eta_minutes)}</KeyValue>
                     <KeyValue label="Actual">{formatMinutes(order.actual_duration_min)}</KeyValue>
                     {variance && (
                       <div className="col-span-2">
@@ -193,7 +193,7 @@ export default function OrderDrawer({ orderId, onClose }: { orderId: string; onC
                     <KeyValue label="Deadline">{formatDateTime(order.deadline)}</KeyValue>
                     <KeyValue label="ETA">{formatMinutes(order.eta_minutes)}</KeyValue>
                     <KeyValue label="Est. distance">{formatKm(order.estimated_distance_km)}</KeyValue>
-                    <KeyValue label="Predicted">{formatMinutes(order.predicted_eta_minutes)}</KeyValue>
+                    <KeyValue label={order.eta_source === 'ml' ? 'Quoted ETA (ML)' : 'Quoted ETA'}>{formatMinutes(order.predicted_eta_minutes)}</KeyValue>
                   </>
                 )}
               </section>
