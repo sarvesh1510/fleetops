@@ -1,14 +1,7 @@
 import { useState } from 'react'
 import { Navigate } from 'react-router-dom'
-import { AlertCircle, Eye, EyeOff, Truck, MapPin, Boxes, BrainCircuit, ShieldCheck } from 'lucide-react'
+import { AlertCircle, Eye, EyeOff, Truck, MapPin, Boxes, BrainCircuit } from 'lucide-react'
 import { useAuthStore } from '../stores/authStore'
-
-const DEMO_ACCOUNTS = [
-  { label: 'Admin', username: 'admin', password: 'Admin123!' },
-  { label: 'Ops Manager', username: 'ops_manager', password: 'Ops123!' },
-  { label: 'Dispatcher', username: 'dispatcher', password: 'Dispatch123!' },
-  { label: 'Viewer', username: 'viewer', password: 'Viewer123!' },
-]
 
 const HIGHLIGHTS = [
   { icon: MapPin, title: 'Live fleet map', desc: '78 vehicles across Mumbai MMR & Delhi NCR, routed on real roads.' },
@@ -36,12 +29,6 @@ export default function LoginPage() {
       setError(err instanceof Error ? err.message : 'Sign in failed')
       setLoading(false)
     }
-  }
-
-  const fillDemo = (u: string, p: string) => {
-    setUsername(u)
-    setPassword(p)
-    setError('')
   }
 
   return (
@@ -138,26 +125,6 @@ export default function LoginPage() {
               {loading ? 'Signing in…' : 'Sign in'}
             </button>
           </form>
-
-          {/* Demo accounts — one-click fill */}
-          <div className="mt-5">
-            <p className="mb-2 flex items-center gap-1.5 text-[11px] font-semibold uppercase tracking-wider text-ink-3">
-              <ShieldCheck size={13} /> Demo accounts — click to fill
-            </p>
-            <div className="grid grid-cols-2 gap-2">
-              {DEMO_ACCOUNTS.map(acc => (
-                <button
-                  key={acc.username}
-                  type="button"
-                  onClick={() => fillDemo(acc.username, acc.password)}
-                  className="btn btn-ghost btn-sm w-full justify-between"
-                >
-                  <span>{acc.label}</span>
-                  <span className="font-mono text-[11px] text-ink-3">{acc.username}</span>
-                </button>
-              ))}
-            </div>
-          </div>
         </div>
       </main>
     </div>

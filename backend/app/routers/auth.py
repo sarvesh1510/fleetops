@@ -1,9 +1,9 @@
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import structlog
 
-from app.core.auth import verify_password, create_access_token, get_current_user
+from app.core.auth import verify_password, hash_password, create_access_token, get_current_user
 from app.db.database import get_db
 
 logger = structlog.get_logger(__name__)
@@ -22,6 +22,11 @@ class LoginResponse(BaseModel):
     username: str
     role: str
     full_name: str
+
+
+class ChangePasswordRequest(BaseModel):
+    current_password: str
+    new_password: str = Field(min_length=8, max_length=128)
 
 
 class MeResponse(BaseModel):
@@ -68,6 +73,38 @@ async def get_me(current_user: dict = Depends(get_current_user)):
         full_name=current_user["full_name"],
         role=current_user["role"],
     )
+
+
+@router.post("/change-password")
+async def change_password(
+    req: ChangePasswordRequest,
+    current_user: dict = Depends(get_current_user),
+    db=Depends(get_db),
+):
+    # get_current_user omits hashed_password, so re-fetch it to verify the current one.
+    user = await db.users.find_one({"user_id": current_user["user_id"]})
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    if not verify_password(req.current_password, user["hashed_password"]):
+        logger.warning("Failed password change (wrong current)", username=user["username"])
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Current password is incorrect",
+        )
+
+    if verify_password(req.new_password, user["hashed_password"]):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="New password must be different from the current password",
+        )
+
+    await db.users.update_one(
+        {"user_id": user["user_id"]},
+        {"$set": {"hashed_password": hash_password(req.new_password), "updated_at": datetime.utcnow()}},
+    )
+    logger.info("Password changed", username=user["username"])
+    return {"message": "Password updated successfully"}
 
 
 @router.post("/logout")

@@ -141,6 +141,79 @@ class TestAuth:
         with pytest.raises(Exception):
             decode_token("not.a.valid.token")
 
+    @pytest.mark.asyncio
+    async def test_change_password_success(self, mock_db):
+        """A correct current password lets the user set a new one."""
+        from app.core.auth import hash_password, verify_password
+        from app.routers.auth import change_password, ChangePasswordRequest
+        try:
+            current_hash = hash_password("OldPass123")
+        except Exception:
+            pytest.skip("bcrypt env incompatibility")
+
+        user = {"user_id": "usr-admin-001", "username": "admin", "hashed_password": current_hash}
+        mock_db.users.find_one = AsyncMock(return_value=user)
+        captured = {}
+        async def _update(filt, update):
+            captured.update(update["$set"])
+        mock_db.users.update_one = AsyncMock(side_effect=_update)
+
+        req = ChangePasswordRequest(current_password="OldPass123", new_password="NewPass456")
+        result = await change_password(req, current_user=user, db=mock_db)
+
+        assert "updated" in result["message"].lower()
+        assert verify_password("NewPass456", captured["hashed_password"])
+        assert not verify_password("OldPass123", captured["hashed_password"])
+
+    @pytest.mark.asyncio
+    async def test_change_password_wrong_current_rejected(self, mock_db):
+        """A wrong current password is refused with 400 and no write."""
+        from fastapi import HTTPException
+        from app.core.auth import hash_password
+        from app.routers.auth import change_password, ChangePasswordRequest
+        try:
+            current_hash = hash_password("OldPass123")
+        except Exception:
+            pytest.skip("bcrypt env incompatibility")
+
+        user = {"user_id": "usr-admin-001", "username": "admin", "hashed_password": current_hash}
+        mock_db.users.find_one = AsyncMock(return_value=user)
+        mock_db.users.update_one = AsyncMock()
+
+        req = ChangePasswordRequest(current_password="WrongPass", new_password="NewPass456")
+        with pytest.raises(HTTPException) as exc:
+            await change_password(req, current_user=user, db=mock_db)
+        assert exc.value.status_code == 400
+        mock_db.users.update_one.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_change_password_same_as_current_rejected(self, mock_db):
+        """Reusing the current password is refused."""
+        from fastapi import HTTPException
+        from app.core.auth import hash_password
+        from app.routers.auth import change_password, ChangePasswordRequest
+        try:
+            current_hash = hash_password("OldPass123")
+        except Exception:
+            pytest.skip("bcrypt env incompatibility")
+
+        user = {"user_id": "usr-admin-001", "username": "admin", "hashed_password": current_hash}
+        mock_db.users.find_one = AsyncMock(return_value=user)
+        mock_db.users.update_one = AsyncMock()
+
+        req = ChangePasswordRequest(current_password="OldPass123", new_password="OldPass123")
+        with pytest.raises(HTTPException) as exc:
+            await change_password(req, current_user=user, db=mock_db)
+        assert exc.value.status_code == 400
+        mock_db.users.update_one.assert_not_called()
+
+    def test_change_password_rejects_short_new_password(self):
+        """Pydantic enforces the 8-char minimum on the new password."""
+        from pydantic import ValidationError
+        from app.routers.auth import ChangePasswordRequest
+        with pytest.raises(ValidationError):
+            ChangePasswordRequest(current_password="whatever", new_password="short")
+
 
 # ── Model Tests ───────────────────────────────────────────────────────────────
 

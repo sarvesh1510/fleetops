@@ -1,12 +1,14 @@
 import { NavLink, Outlet } from 'react-router-dom'
+import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
-import { AlertTriangle, BarChart3, Brain, LayoutDashboard, LogOut, Package, Truck, Zap } from 'lucide-react'
+import { AlertTriangle, BarChart3, Brain, KeyRound, LayoutDashboard, LogOut, Package, Truck, Zap } from 'lucide-react'
 import { useAuthStore } from '../../stores/authStore'
 import { useWSStore } from '../../stores/wsStore'
 import { useRole } from '../../hooks/useRole'
 import { incidentsApi } from '../../services/api'
 import { cx } from '../../lib/utils'
 import { ToastHost } from '../ui'
+import ChangePasswordModal from './ChangePasswordModal'
 
 const NAV = [
   {
@@ -32,6 +34,7 @@ export default function AppLayout() {
   const { user, logout } = useAuthStore()
   const connected = useWSStore(s => s.connected)
   const { roleLabel } = useRole()
+  const [pwdOpen, setPwdOpen] = useState(false)
 
   const { data: incidentStats } = useQuery({
     queryKey: ['incident-stats'],
@@ -82,6 +85,9 @@ export default function AppLayout() {
             <div className="truncate text-[13px] font-semibold leading-tight text-ink">{user?.full_name}</div>
             <div className="truncate text-[11px] text-ink-3">{roleLabel}</div>
           </div>
+          <button onClick={() => setPwdOpen(true)} className="rounded-md p-1.5 text-ink-3 hover:bg-hover hover:text-ink" aria-label="Change password" title="Change password">
+            <KeyRound size={15} />
+          </button>
           <button onClick={logout} className="rounded-md p-1.5 text-ink-3 hover:bg-hover hover:text-ink" aria-label="Sign out" title="Sign out">
             <LogOut size={15} />
           </button>
@@ -92,6 +98,7 @@ export default function AppLayout() {
         <Outlet />
       </main>
       <ToastHost />
+      <ChangePasswordModal open={pwdOpen} onClose={() => setPwdOpen(false)} />
     </div>
   )
 }

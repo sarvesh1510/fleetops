@@ -82,6 +82,8 @@ export const authApi = {
     post<{ access_token: string; user_id: string; username: string; role: string; full_name: string }>(
       '/auth/login', { username, password }),
   me: () => get<{ user_id: string; username: string; email: string; full_name: string; role: string }>('/auth/me'),
+  changePassword: (current_password: string, new_password: string) =>
+    post<{ message: string }>('/auth/change-password', { current_password, new_password }),
 }
 
 // ── Vehicles ───────────────────────────────────────────────────────────────────
