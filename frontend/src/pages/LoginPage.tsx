@@ -3,13 +3,6 @@ import { Navigate } from 'react-router-dom'
 import { AlertCircle, Eye, EyeOff, Truck } from 'lucide-react'
 import { useAuthStore } from '../stores/authStore'
 
-const DEMO_ACCOUNTS = [
-  { username: 'admin', password: 'Admin123!', role: 'Admin', note: 'Full access' },
-  { username: 'ops_manager', password: 'Ops123!', role: 'Ops Manager', note: 'Sim controls' },
-  { username: 'dispatcher', password: 'Dispatch123!', role: 'Dispatcher', note: 'Orders & incidents' },
-  { username: 'viewer', password: 'Viewer123!', role: 'Viewer', note: 'Read-only' },
-]
-
 export default function LoginPage() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
@@ -68,20 +61,6 @@ export default function LoginPage() {
             {loading ? 'Signing in…' : 'Sign in'}
           </button>
         </form>
-
-        <div className="mt-6">
-          <div className="mb-2 text-center text-[11px] font-semibold uppercase tracking-widest text-ink-3">Demo accounts</div>
-          <div className="grid grid-cols-2 gap-2">
-            {DEMO_ACCOUNTS.map(a => (
-              <button key={a.username} type="button" onClick={() => { setUsername(a.username); setPassword(a.password); setError('') }}
-                className="card px-3 py-2 text-left transition-colors hover:border-brand">
-                <div className="text-[13px] font-semibold text-ink">{a.role}</div>
-                <div className="text-xs text-ink-3">{a.note}</div>
-              </button>
-            ))}
-          </div>
-          <p className="mt-2 text-center text-xs text-ink-3">Click one to fill the form, then sign in.</p>
-        </div>
       </div>
     </div>
   )

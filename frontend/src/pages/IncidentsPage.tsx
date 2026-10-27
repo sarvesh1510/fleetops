@@ -74,22 +74,24 @@ export default function IncidentsPage() {
   const items = useMemo(() => list.data?.items ?? [], [list.data])
 
   // Selection is derived, not stored in an effect:
-  //  - the user's explicit pick (selectedId) wins if it's still visible in the list;
-  //  - otherwise, if the pick vanished from the filtered list we keep showing it via a
-  //    standalone fetch (detailQuery);
-  //  - with no pick, default to the first row.
-  const pickInList = selectedId != null ? items.find(i => i.incident_id === selectedId) : undefined
+  //  - the user's explicit pick (selectedId) wins;
+  //  - with no pick, default to the first row;
+  //  - the authoritative detail for that id is always fetched (see below).
   const effectiveId = selectedId ?? items[0]?.incident_id ?? null
 
-  // Fallback fetch for a selection that disappeared from the filtered list.
+  // Authoritative fetch for whatever is currently selected. We always fetch the detail
+  // rather than trusting the list row: a list row is only as fresh as the last list
+  // refetch, so an incident that was auto-resolved (e.g. a repaired breakdown) could keep
+  // showing its pre-resolution status - and the "Resolve" button - until the next poll.
   const detailQuery = useQuery({
-    queryKey: ['incidents', 'detail', selectedId],
-    queryFn: () => incidentsApi.get(selectedId as string),
-    enabled: selectedId != null && !pickInList,
+    queryKey: ['incidents', 'detail', effectiveId],
+    queryFn: () => incidentsApi.get(effectiveId as string),
+    enabled: effectiveId != null,
   })
 
+  // Prefer the freshly fetched record; fall back to the list row only until it arrives.
   const selected: Incident | undefined =
-    items.find(i => i.incident_id === effectiveId) ?? (selectedId != null ? detailQuery.data : undefined)
+    detailQuery.data ?? items.find(i => i.incident_id === effectiveId) ?? undefined
 
   // Reset to first page when filters change.
   const onStatus = (v: StatusFilter) => { setStatus(v); setPage(1) }
